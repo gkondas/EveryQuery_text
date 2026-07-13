@@ -1,0 +1,90 @@
+# EQ_llm_predict — LLM-baseline inference entry point.
+#
+# Serializes task histories as text, queries a locally-served LLM (OpenAI-compatible API,
+# e.g. vLLM) for per-row occurrence probabilities, and writes PredictionSchema-conformant
+# parquets consumable by EQ_evaluate unchanged.  See
+# src/every_query/llm_baseline/README.md for serving setup and usage.
+
+defaults:
+  - _self_
+
+# Required: path to a directory of TaskQuerySchema-conformant parquet files (same contract
+# as EQ_predict's tasks_dir).
+tasks_dir: ???
+
+# Required: path to the tokenized-and-tensorized MEDS cohort produced by EQ_process_data /
+# MTD_preprocess.  EQ_predict recovers this from the training run's resolved config; the
+# LLM baseline has no run dir, so it's a direct input.
+tensorized_cohort_dir: ???
+
+# Required: output directory.  Completed rows stream to {output_dir}/shards/ (plus a
+# details_shards/ sidecar carrying parse_failed / method_used); on completion the shards
+# are merged into {output_dir}/predictions.parquet and {output_dir}/details.parquet.
+output_dir: ???
+
+# Which tensorized-cohort split the task subjects live in.  Same convention as EQ_predict.
+split: held_out
+
+# ── LLM server ──────────────────────────────────────────────────────────────────────────
+
+# OpenAI-compatible endpoint of the locally-served model (vLLM default).
+base_url: http://localhost:8000/v1
+# vLLM ignores the key but the openai SDK requires one.
+api_key: EMPTY
+# Served model name — must match what vLLM was launched with.
+model: meta-llama/Llama-3.1-8B-Instruct
+# Optional HF revision the served model was pinned to.  Not used to make requests (the
+# server owns the weights) — recorded in the output parquet metadata for reproducibility.
+model_revision: null
+
+# ── Probability extraction ──────────────────────────────────────────────────────────────
+
+# "logprob" (default): one-token Yes/No answer, softmax over the two tokens' logprobs —
+#   continuous probabilities, no mode collapse.  Falls back to "guided" per-sample when
+#   neither token appears in the top-k.
+# "guided": free-text numeric answer constrained by vLLM guided_regex, then parsed.
+method: logprob
+# How many top token logprobs to request for the logprob method.
+top_logprobs: 20
+# Written on total parse failure.  null → use the task's marginal prevalence (computed from
+# the input labels per (query, duration_days)), else 0.5.  Failures are always flagged in
+# the details sidecar's parse_failed column — never silently coerced.
+fallback_prob: null
+
+# ── Serialization ───────────────────────────────────────────────────────────────────────
+
+# Keep the most recent max_events events (unique timestamps); older ones are dropped with a
+# marker line.  Per-run truncation stats are logged.
+max_events: 200
+# Optional code → human-readable description mapping (.json dict, or .parquet with
+# code/description columns, e.g. a MEDS metadata/codes.parquet).  null renders raw codes —
+# keep as the on/off switch for the description ablation.
+code_descriptions: null
+
+# ── Generation / execution ──────────────────────────────────────────────────────────────
+
+temperature: 0.0
+seed: 0
+# Concurrent in-flight requests to the local server (semaphore-bounded).
+max_concurrency: 16
+# Completed rows per output shard flush.
+batch_size: 500
+# Per-request timeout (seconds) and retry budget for transient transport errors
+# (connection / timeout / 429 / 5xx), with exponential backoff.  Exhausted retries abort
+# the run — restart with resume=true.
+request_timeout: 120
+max_retries: 5
+
+# ── Smoke path / restarts ───────────────────────────────────────────────────────────────
+
+# Cap the number of rows processed (after resume filtering).  null = no cap.
+limit: null
+# Skip rows already present in {output_dir}/shards/ instead of refusing to start.
+resume: false
+# Print ~3 fully serialized prompts and exit without contacting the server.
+dry_run: false
+
+hydra:
+  output_subdir: null
+  job:
+    chdir: false
