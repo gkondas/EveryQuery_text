@@ -193,6 +193,53 @@ def test_transport_failure_after_retries_raises_not_fallback():
     assert predictor.n_parse_failures == 0  # transport errors are never coerced to fallbacks
 
 
+def test_missing_top_logprobs_falls_back_to_guided_not_half():
+    # Server ignored top_logprobs (only the sampled token came back): a lone one-sided
+    # token must not be scored — the top-k floor bound would collapse every row to a
+    # constant 0.5 flagged as a clean logprob success.  It must fall through to guided.
+    no_topk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="Yes"),
+                logprobs=SimpleNamespace(
+                    content=[SimpleNamespace(token="Yes", logprob=-0.01, top_logprobs=None)]
+                ),
+            )
+        ]
+    )
+    create = AsyncMock(side_effect=[no_topk, _text_response("0.9")])
+    predictor = _predictor(create)
+
+    result = asyncio.run(predictor.predict_prob("history", "question"))
+
+    assert result.method_used == "guided_fallback"
+    assert result.prob == pytest.approx(0.9)
+    assert not result.parse_failed
+
+
+def test_extra_body_merged_with_per_call_precedence():
+    create = AsyncMock(
+        side_effect=[
+            _logprob_response([("Maybe", -0.5), ("It", -1.0)]),  # forces the guided fallback
+            _text_response("0.3"),
+        ]
+    )
+    predictor = _predictor(
+        create,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}, "guided_regex": "WRONG"},
+    )
+
+    asyncio.run(predictor.predict_prob("history", "question"))
+
+    logprob_kwargs = create.await_args_list[0].kwargs
+    assert logprob_kwargs["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert logprob_kwargs["extra_body"]["guided_regex"] == "WRONG"
+    guided_kwargs = create.await_args_list[1].kwargs
+    # Per-call extras win: the guided attempt's real regex overrides the instance-level one.
+    assert guided_kwargs["extra_body"]["guided_regex"] == GUIDED_REGEX
+    assert guided_kwargs["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 def test_invalid_method_rejected_at_construction():
     with pytest.raises(ValueError, match="method must be"):
         LLMPredictor(model="m", method="freeform", client=SimpleNamespace())

@@ -46,8 +46,9 @@ model_revision: null
 method: logprob
 # How many top token logprobs to request for the logprob method.
 top_logprobs: 20
-# Written on total parse failure.  null → use the task's marginal prevalence (computed from
-# the input labels per (query, duration_days)), else 0.5.  Failures are always flagged in
+# Written on total parse failure.  null → 0.5.  Set explicitly to inject an external
+# estimate (e.g. training-split prevalence) — never computed from the evaluated split's own
+# labels, which would leak ground truth into predictions.  Failures are always flagged in
 # the details sidecar's parse_failed column — never silently coerced.
 fallback_prob: null
 # Extra JSON fields merged into every request body (vLLM/OpenAI extensions).  Needed for

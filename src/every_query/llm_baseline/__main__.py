@@ -21,8 +21,10 @@ Differences from ``EQ_predict`` worth knowing about:
   untruncated pre-prediction-time history so serialization-side truncation counts are exact.
 - **Sharded, resumable output.**  A full 70B run will die partway through; completed rows
   are flushed to ``output_dir/shards/`` as they finish (atomic tmp-rename per shard) and
-  ``resume=true`` anti-joins already-written rows out of the pending set.  On completion,
-  shards are merged into ``output_dir/predictions.parquet``.
+  ``resume=true`` anti-joins already-written rows out of the pending set — after first
+  verifying every existing shard's config fingerprint matches the current run (a resume may
+  never silently mix models/prompts/configs).  On completion, shards are merged into
+  ``output_dir/predictions.parquet``.
 - **``censor_prob`` is a constant 0.0.**  Censoring is a data artifact, not a clinical
   prediction, and the LLM is not asked about it.  Downstream this only touches
   ``EQ_evaluate``'s ``censor_auroc`` sanity metric, which degrades to a meaningless-but-
@@ -97,8 +99,28 @@ def _config_hash(cfg: DictConfig) -> str:
     return hashlib.sha256(OmegaConf.to_yaml(cfg, resolve=True).encode()).hexdigest()[:16]
 
 
-def _run_metadata(cfg: DictConfig) -> dict[bytes, bytes]:
-    """Build the parquet key-value metadata blob recorded on every output file."""
+# Metadata fields that determine per-row predictions.  ``resume`` refuses to extend shards
+# whose fingerprint over these fields differs from the current run's — identifier columns
+# alone can't tell a Qwen shard from a Llama shard.
+_FINGERPRINT_FIELDS = (
+    "model",
+    "model_revision",
+    "method",
+    "prompt_template_version",
+    "prompt_template_hash",
+    "max_events",
+    "code_descriptions_used",
+    "code_descriptions_path",
+    "seed",
+    "temperature",
+    "top_logprobs",
+    "fallback_prob",
+    "extra_body",
+)
+
+
+def _run_payload(cfg: DictConfig) -> dict:
+    """Build the reproducibility payload recorded (as JSON) on every output file."""
     payload = {
         "model": cfg.model,
         "model_revision": cfg.model_revision,
@@ -110,56 +132,57 @@ def _run_metadata(cfg: DictConfig) -> dict[bytes, bytes]:
         "code_descriptions_path": cfg.code_descriptions,
         "seed": int(cfg.seed),
         "temperature": float(cfg.temperature),
+        "top_logprobs": int(cfg.top_logprobs),
+        "fallback_prob": None if cfg.fallback_prob is None else float(cfg.fallback_prob),
         "extra_body": None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
-        "config_hash": _config_hash(cfg),
-        "created_at": datetime.now(UTC).isoformat(),
     }
+    fingerprint_subset = {k: payload[k] for k in _FINGERPRINT_FIELDS}
+    payload["run_fingerprint"] = hashlib.sha256(
+        json.dumps(fingerprint_subset, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    payload["config_hash"] = _config_hash(cfg)
+    payload["created_at"] = datetime.now(UTC).isoformat()
+    return payload
+
+
+def _run_metadata(payload: dict) -> dict[bytes, bytes]:
+    """Wrap the reproducibility payload as parquet key-value metadata."""
     return {METADATA_KEY: json.dumps(payload).encode()}
 
 
-def _prevalence_by_task(identifiers: pl.DataFrame) -> dict[tuple[str, float], float]:
-    """Per-``(query, duration_days)`` marginal prevalence among non-censored rows.
+def _validate_resume_fingerprint(shards_dir: Path, payload: dict) -> None:
+    """Refuse to resume onto shards produced under a different prediction-affecting config.
 
-    Used as the parse-failure fallback probability when ``fallback_prob`` is null.  Tasks
-    whose rows are all censored (or unlabeled inputs) get no entry — those rows fall back to
-    0.5 via the predictor default.
-
-    Examples:
-        >>> ids = pl.DataFrame({
-        ...     "query": ["A", "A", "A", "B"],
-        ...     "duration_days": pl.Series([30.0, 30.0, 30.0, 30.0], dtype=pl.Float32),
-        ...     "boolean_value": [True, False, None, None],
-        ... })
-        >>> _prevalence_by_task(ids)
-        {('A', 30.0): 0.5}
-
-        Unlabeled input (no ``boolean_value`` column) yields no prevalences:
-
-        >>> _prevalence_by_task(ids.drop("boolean_value"))
-        {}
+    Compares the ``run_fingerprint`` recorded in each existing shard's metadata against the
+    current run's; on mismatch, raises with the differing fields spelled out.
     """
-    if TaskQuerySchema.boolean_value_name not in identifiers.columns:
-        return {}
-    prevalence = (
-        identifiers.drop_nulls(TaskQuerySchema.boolean_value_name)
-        .group_by(TaskQuerySchema.query_name, TaskQuerySchema.duration_days_name)
-        .agg(pl.col(TaskQuerySchema.boolean_value_name).mean().alias("prevalence"))
-    )
-    return {
-        (row[TaskQuerySchema.query_name], float(row[TaskQuerySchema.duration_days_name])): float(
-            row["prevalence"]
+    for fp in sorted(shards_dir.glob("*.parquet")):
+        blob = (pq.read_schema(fp).metadata or {}).get(METADATA_KEY)
+        existing = json.loads(blob) if blob else {}
+        if existing.get("run_fingerprint") == payload["run_fingerprint"]:
+            continue
+        diffs = {
+            k: {"shard": existing.get(k), "current": payload.get(k)}
+            for k in _FINGERPRINT_FIELDS
+            if existing.get(k) != payload.get(k)
+        }
+        raise ValueError(
+            f"resume=true, but existing shard {fp.name} was produced under a different "
+            f"configuration — refusing to silently mix predictions.  Differing fields: "
+            f"{json.dumps(diffs, indent=2)}\nPoint output_dir at a new path, or rerun with "
+            f"the original configuration."
         )
-        for row in prevalence.iter_rows(named=True)
-    }
 
 
 @dataclass
 class _HistorySerializer:
-    """Serializes each ``(subject_id, prediction_time)`` group's history exactly once.
+    """Serializes one ``(subject_id, prediction_time)`` group's history per call.
 
     Wraps the dataset's base-class ``load_subject_data`` (full untruncated pre-prediction window, no prepended
-    query token) and caches by dataset row group so the many ``(query, duration_days)`` rows sharing one
-    prediction context reuse a single serialized string.  Tracks truncation stats for the per-run log line.
+    query token).  Callers are responsible for calling once per group and sharing the returned string across
+    that group's ``(query, duration_days)`` rows — no cache is kept here, so serialized histories are released
+    as soon as the caller drops them (memory stays bounded on large cohorts).  Tracks truncation stats for the
+    per-run log line.
     """
 
     dataset: EveryQueryPytorchDataset
@@ -168,7 +191,6 @@ class _HistorySerializer:
 
     def __post_init__(self) -> None:
         self._index_to_code = {idx: code for code, idx in self.dataset.code_to_index.items()}
-        self._cache: dict[tuple[int, datetime], SerializedHistory] = {}
         self._gap_days = self._gaps_from_schema_df()
         self.n_serialized = 0
         self.n_truncated = 0
@@ -191,13 +213,8 @@ class _HistorySerializer:
         return [max(g, 0.0) for g in gaps]
 
     def history_for_row(self, row_idx: int) -> SerializedHistory:
-        """Return the serialized history for dataset row ``row_idx``, cached per group."""
+        """Serialize the history for dataset row ``row_idx`` (call once per group)."""
         subject_id, end_idx = self.dataset.index[row_idx]
-        prediction_time = self.dataset.schema_df[TaskQuerySchema.prediction_time_name][row_idx]
-        key = (subject_id, prediction_time)
-        if key in self._cache:
-            return self._cache[key]
-
         dynamic_data, _static = self.dataset.load_subject_data(subject_id=subject_id, st=0, end=end_idx)
         events = events_from_jnrt_dense(
             dynamic_data.to_dense(), self._index_to_code, gap_days=self._gap_days[row_idx]
@@ -205,7 +222,6 @@ class _HistorySerializer:
         history = serialize_history(
             events, max_events=self.max_events, code_descriptions=self.code_descriptions
         )
-        self._cache[key] = history
         self.n_serialized += 1
         self.n_truncated += int(history.truncated)
         return history
@@ -250,7 +266,10 @@ class _ShardedWriter:
 
     @staticmethod
     def _atomic_write(table: pa.Table, target: Path) -> None:
-        tmp = target.with_name(target.name + ".tmp")
+        # Dot-prefixed staging name: pyarrow dataset discovery skips '.'-prefixed files and
+        # the resume scan globs '*.parquet', so a leftover from a hard kill mid-write can
+        # neither be swept into the final merge nor mistaken for a completed shard.
+        tmp = target.with_name("." + target.name + ".tmp")
         pq.write_table(table, tmp)
         tmp.replace(target)
 
@@ -284,10 +303,13 @@ class _ShardedWriter:
         )
 
         shard_name = f"shard_{self._run_id}_{self._n_shards:05d}.parquet"
-        self._atomic_write(aligned, self._shards_dir / shard_name)
+        # Details first: resume completeness is keyed on prediction shards, so the shard the
+        # resume scan trusts must be the last artifact published — a crash between the two
+        # writes then re-runs the batch instead of leaving a permanent sidecar hole.
         self._atomic_write(
             details.to_arrow().replace_schema_metadata(self._metadata), self._details_dir / shard_name
         )
+        self._atomic_write(aligned, self._shards_dir / shard_name)
         self._n_shards += 1
         self.n_rows_written += len(results)
         logger.info(f"Flushed shard {shard_name} ({len(results)} rows; {self.n_rows_written} total)")
@@ -314,8 +336,13 @@ def _pending_row_idxs(identifiers: pl.DataFrame, shards_dir: Path, resume: bool)
 
 
 def _merge_shards(shards_dir: Path, out_fp: Path, metadata: dict[bytes, bytes]) -> int:
-    """Concatenate all shards into a single parquet at ``out_fp``; returns the row count."""
-    merged = pq.read_table(shards_dir).replace_schema_metadata(metadata)
+    """Concatenate all shards into a single parquet at ``out_fp``; returns the row count.
+
+    Reads only ``*.parquet`` files — never directory-level dataset discovery, which would
+    sweep in leftover staging files from a hard-killed run.
+    """
+    tables = [pq.read_table(fp) for fp in sorted(shards_dir.glob("*.parquet"))]
+    merged = pa.concat_tables(tables).replace_schema_metadata(metadata)
     tmp = out_fp.with_name(out_fp.name + ".tmp")
     pq.write_table(merged, tmp)
     tmp.replace(out_fp)
@@ -358,6 +385,16 @@ def _print_dry_run_prompts(
     print(f"\n{'=' * 80}\nDry run: {shown} prompt(s) shown; no requests were sent.")
 
 
+def _group_pending_rows(identifiers: pl.DataFrame, pending: list[int]) -> list[list[int]]:
+    """Group pending row indices by ``(subject_id, prediction_time)``, preserving row order."""
+    groups: dict[tuple, list[int]] = {}
+    subject_ids = identifiers[TaskQuerySchema.subject_id_name]
+    prediction_times = identifiers[TaskQuerySchema.prediction_time_name]
+    for row_idx in pending:
+        groups.setdefault((subject_ids[row_idx], prediction_times[row_idx]), []).append(row_idx)
+    return list(groups.values())
+
+
 async def _run_async(
     cfg: DictConfig,
     predictor: LLMPredictor,
@@ -365,44 +402,53 @@ async def _run_async(
     identifiers: pl.DataFrame,
     pending: list[int],
     writer: _ShardedWriter,
-    prevalences: dict[tuple[str, float], float],
     code_descriptions: dict[str, str] | None,
 ) -> None:
-    """Fan pending rows out to the LLM (semaphore-bounded) and flush shards as they finish."""
+    """Stream pending rows through a bounded queue of LLM workers, flushing shards as they finish.
 
-    async def one_row(row_idx: int) -> tuple[int, ProbabilityResult]:
-        history = serializer.history_for_row(row_idx)
-        query = identifiers[TaskQuerySchema.query_name][row_idx]
-        duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
-        question = serialize_question(query, duration, code_descriptions)
-        result = await predictor.predict_prob(
-            history.text, question, fallback_prob=prevalences.get((query, duration))
-        )
-        return row_idx, result
-
-    # Serialize all histories up front (sequential disk IO, cached per group) so truncation
-    # stats are complete before the first request and event-loop workers stay IO-only.
-    for row_idx in pending:
-        serializer.history_for_row(row_idx)
-    serializer.log_truncation_stats()
-
-    buffer: list[tuple[int, ProbabilityResult]] = []
+    The producer serializes each ``(subject_id, prediction_time)`` group's history exactly once
+    and enqueues that group's rows sharing the one string; the bounded queue then backpressures
+    the producer, so peak memory scales with ``max_concurrency`` + the queue bound + one flush
+    buffer — never with the cohort size.
+    """
+    n_workers = int(cfg.max_concurrency)
     shard_size = int(cfg.batch_size)
-    tasks = [asyncio.create_task(one_row(row_idx)) for row_idx in pending]
-    try:
-        for future in asyncio.as_completed(tasks):
-            buffer.append(await future)
+    queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue(maxsize=max(2 * n_workers, 32))
+    buffer: list[tuple[int, ProbabilityResult]] = []
+
+    async def producer() -> None:
+        for row_idxs in _group_pending_rows(identifiers, pending):
+            history = serializer.history_for_row(row_idxs[0])
+            for row_idx in row_idxs:
+                await queue.put((row_idx, history.text))
+        for _ in range(n_workers):
+            await queue.put(None)
+
+    async def worker() -> None:
+        while (item := await queue.get()) is not None:
+            row_idx, history_text = item
+            query = identifiers[TaskQuerySchema.query_name][row_idx]
+            duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
+            question = serialize_question(query, duration, code_descriptions)
+            result = await predictor.predict_prob(history_text, question)
+            buffer.append((row_idx, result))
             if len(buffer) >= shard_size:
                 writer.flush(buffer)
-                buffer = []
+                buffer.clear()
+
+    tasks = [asyncio.create_task(producer())] + [asyncio.create_task(worker()) for _ in range(n_workers)]
+    try:
+        await asyncio.gather(*tasks)
     except BaseException:
         # A transport failure (or Ctrl-C) aborts the run; flush what already completed so
-        # resume=true can pick up from here, then cancel the in-flight remainder.
+        # resume=true can pick up from here, then cancel the still-running remainder.
         writer.flush(buffer)
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         raise
     writer.flush(buffer)
+    serializer.log_truncation_stats()
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="llm_predict")
@@ -468,7 +514,10 @@ def main(cfg: DictConfig) -> None:
         _print_dry_run_prompts(serializer, identifiers, pending, cfg.method, code_descriptions)
         return
 
-    metadata = _run_metadata(cfg)
+    payload = _run_payload(cfg)
+    metadata = _run_metadata(payload)
+    if cfg.resume:
+        _validate_resume_fingerprint(shards_dir, payload)
     predictor = LLMPredictor(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -483,17 +532,14 @@ def main(cfg: DictConfig) -> None:
         fallback_prob=0.5 if cfg.fallback_prob is None else float(cfg.fallback_prob),
         extra_body=None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
     )
-    # Per-task marginal prevalence is the parse-failure fallback only when the user hasn't
-    # pinned an explicit fallback_prob.
-    prevalences = _prevalence_by_task(identifiers) if cfg.fallback_prob is None else {}
 
-    run_id = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+    # Microsecond precision: two runs into the same output_dir (e.g. an immediate resume
+    # after a fast partial run) must never collide on shard filenames.
+    run_id = datetime.now(UTC).strftime("%Y%m%d%H%M%S%f")
     writer = _ShardedWriter(identifiers, shards_dir, details_dir, metadata, run_id)
 
     t0 = time.perf_counter()
-    asyncio.run(
-        _run_async(cfg, predictor, serializer, identifiers, pending, writer, prevalences, code_descriptions)
-    )
+    asyncio.run(_run_async(cfg, predictor, serializer, identifiers, pending, writer, code_descriptions))
     elapsed = time.perf_counter() - t0
 
     if predictor.n_parse_failures:
@@ -509,7 +555,13 @@ def main(cfg: DictConfig) -> None:
     )
 
     n_merged = _merge_shards(shards_dir, output_dir / "predictions.parquet", metadata)
-    _merge_shards(details_dir, output_dir / "details.parquet", metadata)
+    n_details = _merge_shards(details_dir, output_dir / "details.parquet", metadata)
+    if n_details != n_merged:
+        logger.warning(
+            f"details.parquet has {n_details} rows but predictions.parquet has {n_merged} — "
+            f"a crash between shard writes on an earlier run likely left extra details rows; "
+            f"diagnostics only, predictions are unaffected."
+        )
     logger.info(f"Merged {n_merged} predictions to {output_dir / 'predictions.parquet'}")
 
 

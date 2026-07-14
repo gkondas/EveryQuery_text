@@ -28,6 +28,7 @@ _ENTRYPOINTS: list[str] = [
     "EQ_generate_training_tasks",
     "EQ_generate_evaluation_tasks",
     "EQ_predict",
+    "EQ_llm_predict",
     "EQ_evaluate",
 ]
 

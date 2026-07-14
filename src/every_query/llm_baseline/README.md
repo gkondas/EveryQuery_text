@@ -85,8 +85,9 @@ Two methods behind the `method` config field (see `llm_predict.py`):
 - **`guided` (fallback / comparison).** Free-text numeric answer constrained with vLLM's
   `guided_regex` structured output (`(0\.\d{1,4}|1\.0|0|1)`), then parsed.
 
-On total parse failure the configured `fallback_prob` is written (default: the task's
-marginal prevalence from the input labels, else 0.5), and the row is flagged
+On total parse failure the configured `fallback_prob` is written (default 0.5; set it
+explicitly to inject an externally-estimated prevalence — it is never computed from the
+evaluated split's labels, which would leak ground truth), and the row is flagged
 `parse_failed=True` in `details.parquet`. Transport failures (after bounded retries with
 exponential backoff) abort the run instead of writing fallbacks — restart with
 `resume=true`.

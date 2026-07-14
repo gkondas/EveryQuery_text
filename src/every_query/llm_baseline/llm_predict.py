@@ -178,6 +178,11 @@ def _first_token_top_logprobs(response) -> list[tuple[str, float]]:
         return []
     first = content[0]
     pairs = [(entry.token, entry.logprob) for entry in (first.top_logprobs or [])]
+    if not pairs:
+        # No top-k at all (server ignored ``top_logprobs``): a lone sampled token would make
+        # yes_no_probability's one-sided floor bound collapse to a constant 0.5, silently
+        # flattening every prediction — treat as parse failure so the guided fallback runs.
+        return []
     # The sampled token itself is normally repeated inside top_logprobs, but not on every
     # server version — include it defensively (duplicates are harmless for a max/min scan).
     pairs.append((first.token, first.logprob))
@@ -288,7 +293,7 @@ class LLMPredictor:
 
         Runs the configured primary method; the ``logprob`` method falls back to ``guided``
         when neither Yes nor No is found in the top-k.  On total parse failure, returns
-        ``fallback_prob`` (per-row override, e.g. the task's marginal prevalence) or the
+        ``fallback_prob`` (per-row override, e.g. an externally-estimated prevalence) or the
         instance-level default, flagged ``parse_failed=True``.
 
         Raises:

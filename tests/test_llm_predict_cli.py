@@ -85,7 +85,11 @@ def _overrides(tasks_dir: Path, cohort_dir: Path, output_dir: Path, **extra) -> 
 class _FakeCompletions:
     """Always answers Yes/No with fixed logprobs, shaped like the openai SDK response."""
 
+    def __init__(self) -> None:
+        self.n_calls = 0
+
     async def create(self, **kwargs):
+        self.n_calls += 1
         entries = [
             SimpleNamespace(token="Yes", logprob=_YES_LOGPROB),
             SimpleNamespace(token=" No", logprob=_NO_LOGPROB),
@@ -101,16 +105,18 @@ class _FakeCompletions:
         )
 
 
-def _run_main_with_fake_client(argv_overrides: list[str]) -> None:
+def _run_main_with_fake_client(argv_overrides: list[str]) -> _FakeCompletions:
     """Invoke the hydra-decorated main in-process with the OpenAI client mocked out."""
     from every_query.llm_baseline.__main__ import main
 
-    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+    completions = _FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     with (
         patch("every_query.llm_baseline.llm_predict.AsyncOpenAI", return_value=fake_client),
         patch.object(sys, "argv", ["EQ_llm_predict", *argv_overrides]),
     ):
         main()
+    return completions
 
 
 def test_llm_predict_dry_run_subprocess(tensorized_cohort_dir, llm_tasks_dir, tmp_path):
@@ -171,7 +177,49 @@ def test_llm_predict_full_run_and_resume(tensorized_cohort_dir, llm_tasks_dir, t
         _run_main_with_fake_client(_overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir))
 
     # …and with resume=true it finds nothing pending and leaves the output unchanged.
-    _run_main_with_fake_client(
+    resumed = _run_main_with_fake_client(
         _overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir, resume="true")
     )
+    assert resumed.n_calls == 0
     assert pl.read_parquet(predictions_fp).height == n_tasks
+
+
+def test_llm_predict_partial_resume(tensorized_cohort_dir, llm_tasks_dir, tmp_path):
+    """resume=true after an interrupted (limit-capped) run issues only the remaining requests."""
+    output_dir = tmp_path / "out"
+    n_tasks = len(_SUBJECT_PRED_TIMES) * len(_QUERY_CODES)
+
+    first = _run_main_with_fake_client(_overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir, limit=2))
+    assert first.n_calls == 2
+
+    # A leftover staging file from a hard-killed run must never be swept into the merge
+    # (regression: pyarrow directory-level dataset discovery reads any extension).
+    (output_dir / "shards" / "shard_leftover.parquet.tmp").write_bytes(b"not a parquet")
+
+    second = _run_main_with_fake_client(
+        _overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir, resume="true")
+    )
+    assert second.n_calls == n_tasks - 2
+
+    predictions = pl.read_parquet(output_dir / "predictions.parquet")
+    assert predictions.height == n_tasks
+    id_cols = ["subject_id", "prediction_time", "query", "duration_days"]
+    assert predictions.unique(subset=id_cols).height == n_tasks
+    details = pl.read_parquet(output_dir / "details.parquet")
+    assert details.height == n_tasks
+
+
+def test_llm_predict_resume_refuses_config_mismatch(tensorized_cohort_dir, llm_tasks_dir, tmp_path):
+    """resume=true onto shards produced under a different model raises instead of mixing.
+
+    The underlying ValueError is converted to SystemExit(1) by hydra's error handling.
+    """
+    output_dir = tmp_path / "out"
+    _run_main_with_fake_client(_overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir, limit=1))
+
+    with pytest.raises(SystemExit):
+        _run_main_with_fake_client(
+            _overrides(
+                llm_tasks_dir, tensorized_cohort_dir, output_dir, resume="true", model="some/other-model"
+            )
+        )
