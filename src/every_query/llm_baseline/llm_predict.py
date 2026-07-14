@@ -211,6 +211,7 @@ class LLMPredictor:
         request_timeout: float = 120.0,
         top_logprobs: int = 20,
         fallback_prob: float = 0.5,
+        extra_body: dict | None = None,
         client: AsyncOpenAI | None = None,
     ) -> None:
         if method not in ("logprob", "guided"):
@@ -222,6 +223,7 @@ class LLMPredictor:
         self.max_retries = max_retries
         self.top_logprobs = top_logprobs
         self.fallback_prob = fallback_prob
+        self.extra_body = extra_body
         self._client = client or AsyncOpenAI(
             base_url=base_url, api_key=api_key, timeout=request_timeout, max_retries=0
         )
@@ -233,6 +235,9 @@ class LLMPredictor:
 
     async def _create(self, **kwargs):
         """One chat-completion call with exponential-backoff retries on transient errors."""
+        if self.extra_body:
+            # Per-call extras (e.g. guided_regex) win over instance-level ones.
+            kwargs["extra_body"] = {**self.extra_body, **kwargs.get("extra_body", {})}
         for attempt in range(self.max_retries + 1):
             try:
                 self.n_requests += 1

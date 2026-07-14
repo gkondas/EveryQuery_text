@@ -110,6 +110,7 @@ def _run_metadata(cfg: DictConfig) -> dict[bytes, bytes]:
         "code_descriptions_path": cfg.code_descriptions,
         "seed": int(cfg.seed),
         "temperature": float(cfg.temperature),
+        "extra_body": None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
         "config_hash": _config_hash(cfg),
         "created_at": datetime.now(UTC).isoformat(),
     }
@@ -480,6 +481,7 @@ def main(cfg: DictConfig) -> None:
         request_timeout=float(cfg.request_timeout),
         top_logprobs=int(cfg.top_logprobs),
         fallback_prob=0.5 if cfg.fallback_prob is None else float(cfg.fallback_prob),
+        extra_body=None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
     )
     # Per-task marginal prevalence is the parse-failure fallback only when the user hasn't
     # pinned an explicit fallback_prob.

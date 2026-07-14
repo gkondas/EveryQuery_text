@@ -50,6 +50,10 @@ top_logprobs: 20
 # the input labels per (query, duration_days)), else 0.5.  Failures are always flagged in
 # the details sidecar's parse_failed column — never silently coerced.
 fallback_prob: null
+# Extra JSON fields merged into every request body (vLLM/OpenAI extensions).  Needed for
+# thinking-style models whose first token would otherwise be reasoning rather than Yes/No,
+# e.g. Qwen3.5:  extra_body='{chat_template_kwargs: {enable_thinking: false}}'
+extra_body: null
 
 # ── Serialization ───────────────────────────────────────────────────────────────────────
 
