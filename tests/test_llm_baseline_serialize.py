@@ -36,9 +36,10 @@ _DESCRIPTIONS = {
 
 @pytest.fixture
 def fixture_dense() -> dict[str, np.ndarray]:
-    """Three events: (diabetes dx + HbA1c lab), (hypertension dx), (HbA1c lab), 120/108/75d ago."""
+    """Three events: (diabetes dx + HbA1c lab), (hypertension dx), (HbA1c lab)."""
     return {
-        # Deltas between consecutive events; the leading NaN mirrors MTD's first-event delta.
+        # Present on real MTD output but ignored by serialization (time is carried by the
+        # TIMELINE//DELTA tokens in the stream, not rendered as a per-event tag).
         "time_delta_days": np.array([np.nan, 12.0, 33.0]),
         "code": np.array([[3, 4], [5, 0], [4, 0]]),
         "numeric_value": np.array([[np.nan, 7.2], [np.nan, np.nan], [7.9, np.nan]]),
@@ -46,10 +47,10 @@ def fixture_dense() -> dict[str, np.ndarray]:
     }
 
 
-def test_events_from_jnrt_dense_times_and_values(fixture_dense):
-    # gap_days=75 → the last event sits 75 days before prediction time.
-    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
-    assert [round(e.days_before_prediction) for e in events] == [-120, -108, -75]
+def test_events_from_jnrt_dense_grouping_and_values(fixture_dense):
+    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
+    # One Event per unique timestamp (row), measurements grouped within.
+    assert [len(e.measurements) for e in events] == [2, 1, 1]
     assert [m.code for e in events for m in e.measurements] == [
         "ICD//E11.9",
         "LAB//HbA1c",
@@ -61,14 +62,14 @@ def test_events_from_jnrt_dense_times_and_values(fixture_dense):
 
 
 def test_golden_history_without_descriptions(fixture_dense):
-    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
+    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
     history = serialize_history(events, max_events=10)
     assert history.text == (
         "Patient history (most recent last):\n"
-        "- [-120d] ICD//E11.9\n"
-        "- [-120d] LAB//HbA1c: 7.2\n"
-        "- [-108d] ICD//I10\n"
-        "- [-75d] LAB//HbA1c: 7.9"
+        "- ICD//E11.9\n"
+        "- LAB//HbA1c: 7.2\n"
+        "- ICD//I10\n"
+        "- LAB//HbA1c: 7.9"
     )
     assert not history.truncated
     assert history.n_events_total == 3
@@ -77,22 +78,22 @@ def test_golden_history_without_descriptions(fixture_dense):
 
 
 def test_golden_history_with_descriptions(fixture_dense):
-    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
+    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
     history = serialize_history(events, max_events=10, code_descriptions=_DESCRIPTIONS)
     assert history.text == (
         "Patient history (most recent last):\n"
-        "- [-120d] ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
-        "- [-120d] LAB//HbA1c: 7.2\n"
-        "- [-108d] ICD//I10 (Essential hypertension)\n"
-        "- [-75d] LAB//HbA1c: 7.9"
+        "- ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
+        "- LAB//HbA1c: 7.2\n"
+        "- ICD//I10 (Essential hypertension)\n"
+        "- LAB//HbA1c: 7.9"
     )
 
 
 def test_golden_history_truncation(fixture_dense):
-    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
+    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
     history = serialize_history(events, max_events=1)
     assert history.text == (
-        "Patient history (most recent last):\n[2 earlier events omitted]\n- [-75d] LAB//HbA1c: 7.9"
+        "Patient history (most recent last):\n[2 earlier events omitted]\n- LAB//HbA1c: 7.9"
     )
     assert history.truncated
     assert (history.n_events_total, history.n_events_dropped) == (3, 2)
@@ -108,16 +109,16 @@ def test_empty_history_placeholder():
 
 
 def test_full_prompt_golden(fixture_dense):
-    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
+    events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
     history = serialize_history(events, max_events=10, code_descriptions=_DESCRIPTIONS)
     question = serialize_question("ICD//I50.9", 90.0, _DESCRIPTIONS)
     prompt = build_user_prompt(history.text, question)
     assert prompt == (
         "Patient history (most recent last):\n"
-        "- [-120d] ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
-        "- [-120d] LAB//HbA1c: 7.2\n"
-        "- [-108d] ICD//I10 (Essential hypertension)\n"
-        "- [-75d] LAB//HbA1c: 7.9\n"
+        "- ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
+        "- LAB//HbA1c: 7.2\n"
+        "- ICD//I10 (Essential hypertension)\n"
+        "- LAB//HbA1c: 7.9\n"
         "\n"
         "Question: Will code ICD//I50.9 (Heart failure, unspecified) occur within 90 days?\n"
         "Answer with exactly one word: Yes or No."
@@ -125,7 +126,7 @@ def test_full_prompt_golden(fixture_dense):
 
 
 def test_unknown_code_index_renders_marker(fixture_dense):
-    events = events_from_jnrt_dense(fixture_dense, {}, gap_days=0.0)
+    events = events_from_jnrt_dense(fixture_dense, {})
     assert events[0].measurements[0].code == "UNKNOWN_CODE_3"
 
 
@@ -135,9 +136,9 @@ def test_prompt_template_hash_is_stable_and_short():
 
 
 def test_events_are_immutable():
-    event = Event(-1.0, (Measurement("HR", 88.0),))
+    event = Event((Measurement("HR", 88.0),))
     with pytest.raises(AttributeError):
-        event.days_before_prediction = 0.0
+        event.measurements = ()
 
 
 def test_load_code_descriptions_rejects_unknown_suffix(tmp_path):

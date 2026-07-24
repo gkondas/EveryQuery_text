@@ -90,11 +90,6 @@ _ID_COLS = [
     TaskQuerySchema.duration_days_name,
 ]
 
-# MTD schema_df column holding the timestamp of the last event inside each row's window
-# (populated because we set ``include_window_last_observed_in_schema=True``); used to anchor
-# serialized event times at the prediction time rather than at the last observed event.
-_LAST_TIME_COL = "window_last_observed"
-
 
 def _config_hash(cfg: DictConfig) -> str:
     """Short stable fingerprint of the resolved run config."""
@@ -195,34 +190,14 @@ class _HistorySerializer:
 
     def __post_init__(self) -> None:
         self._index_to_code = {idx: code for code, idx in self.dataset.code_to_index.items()}
-        self._gap_days = self._gaps_from_schema_df()
         self.n_serialized = 0
         self.n_truncated = 0
-
-    def _gaps_from_schema_df(self) -> list[float]:
-        """Per-row gap (days) between the last observed event and the prediction time."""
-        schema_df = self.dataset.schema_df
-        if _LAST_TIME_COL not in schema_df.columns:
-            logger.warning(
-                f"schema_df has no {_LAST_TIME_COL!r} column; serialized event times will be "
-                f"anchored at the last observed event instead of the prediction time."
-            )
-            return [0.0] * schema_df.height
-        gaps = (
-            (schema_df[TaskQuerySchema.prediction_time_name] - schema_df[_LAST_TIME_COL])
-            .dt.total_seconds()
-            .cast(pl.Float64)
-            / 86400.0
-        ).fill_null(0.0)
-        return [max(g, 0.0) for g in gaps]
 
     def history_for_row(self, row_idx: int) -> SerializedHistory:
         """Serialize the history for dataset row ``row_idx`` (call once per group)."""
         subject_id, end_idx = self.dataset.index[row_idx]
         dynamic_data, _static = self.dataset.load_subject_data(subject_id=subject_id, st=0, end=end_idx)
-        events = events_from_jnrt_dense(
-            dynamic_data.to_dense(), self._index_to_code, gap_days=self._gap_days[row_idx]
-        )
+        events = events_from_jnrt_dense(dynamic_data.to_dense(), self._index_to_code)
         history = serialize_history(
             events, max_events=self.max_events, code_descriptions=self.code_descriptions
         )
@@ -483,7 +458,6 @@ def main(cfg: DictConfig) -> None:
         seq_sampling_strategy="to_end",
         static_inclusion_mode="omit",
         batch_mode="SM",
-        include_window_last_observed_in_schema=True,
     )
     dataset = EveryQueryPytorchDataset(dataset_cfg, split=cfg.split)
     identifiers = _identifiers_from_schema_df(dataset.schema_df)

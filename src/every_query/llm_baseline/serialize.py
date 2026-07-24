@@ -6,12 +6,9 @@ sample is built from (vocab-index codes, inter-event ``time_delta_days``, option
 
 Conventions:
 
-- ``time_delta_days`` is a **delta between consecutive events**, not an absolute timestamp.
-  :func:`events_from_jnrt_dense` cumulative-sums it and renders each event as days *before
-  the prediction time* (negative, e.g. ``[-45d]``), so the "within the next d days" question
-  is naturally anchored at 0.  The gap between the last observed event and the actual
-  prediction time is passed in as ``gap_days`` (from MTD's ``window_last_observed`` schema
-  column) so the anchor is the prediction time itself, not the last event.
+- Events are rendered in chronological order (most recent last) **without** an explicit
+  time tag — elapsed time between events is conveyed by the ``TIMELINE//DELTA`` tokens
+  already present in the event stream, so ``time_delta_days`` is not rendered here.
 - ``numeric_value`` is included where present and omitted entirely where absent — no
   ``None`` / ``nan`` ever appears in the text.
 - Histories longer than ``max_events`` are truncated from the left (most recent events
@@ -34,20 +31,20 @@ import numpy as np
 
 # ── Prompt template (versioned; every constant below feeds prompt_template_hash) ────────
 
-PROMPT_TEMPLATE_VERSION = "1"
+PROMPT_TEMPLATE_VERSION = "2"
 
 SYSTEM_PROMPT = (
     "You are a clinical prediction assistant. You are given a patient's medical event history "
-    "as a list of timestamped codes, where times are in days relative to the prediction time "
-    "(day 0). Answer the question about a future clinical event based only on the provided "
-    "history."
+    "as a chronologically ordered list of codes (most recent last); the passage of time between "
+    "events is indicated by TIMELINE//DELTA tokens. Answer the question about a future clinical "
+    "event based only on the provided history."
 )
 
 HISTORY_HEADER = "Patient history (most recent last):"
 TRUNCATION_LINE = "[{n} earlier {noun} omitted]"
 EMPTY_HISTORY_LINE = "- (no prior events recorded)"
-EVENT_LINE = "- [{days}d] {code}"
-EVENT_LINE_WITH_VALUE = "- [{days}d] {code}: {value}"
+EVENT_LINE = "- {code}"
+EVENT_LINE_WITH_VALUE = "- {code}: {value}"
 QUESTION_LINE = "Question: Will code {code} occur within {days} days?"
 YESNO_INSTRUCTION = "Answer with exactly one word: Yes or No."
 
@@ -94,28 +91,26 @@ class Measurement:
 
 @dataclass(frozen=True)
 class Event:
-    """One event (unique timestamp): its time relative to prediction plus its measurements.
+    """One event (unique timestamp): the measurements sharing that timestamp.
 
-    ``days_before_prediction`` is ≤ 0 by construction — 0 means the event coincides with the prediction time.
+    Elapsed time between events is not held here — it is carried by the ``TIMELINE//DELTA``
+    tokens already present in the event stream.
     """
 
-    days_before_prediction: float
     measurements: tuple[Measurement, ...]
 
 
 def events_from_jnrt_dense(
     dense: dict[str, np.ndarray],
     index_to_code: dict[int, str],
-    gap_days: float = 0.0,
 ) -> list[Event]:
     """Convert a single subject's densified nested-ragged event data into :class:`Event` s.
 
     ``dense`` is the ``to_dense()`` output of the ``JointNestedRaggedTensorDict`` returned by
-    ``MEDSPytorchDataset.load_subject_data`` — ``time_delta_days`` is ``[n_events]``, ``code``
-    / ``numeric_value`` are ``[n_events, max_measurements]`` with a ``dim1/mask`` validity
-    mask.  ``time_delta_days`` deltas are cumulative-summed and re-anchored so the *last*
-    event sits at ``-gap_days`` (the gap between the last observed event and the prediction
-    time); all times come out ≤ 0, i.e. days before prediction time.
+    ``MEDSPytorchDataset.load_subject_data`` — ``code`` / ``numeric_value`` are
+    ``[n_events, max_measurements]`` with a ``dim1/mask`` validity mask.  One :class:`Event` is
+    emitted per row (unique timestamp), in stream order; elapsed time between events is not
+    computed here — it is carried by the ``TIMELINE//DELTA`` tokens already in the stream.
 
     Pad entries (code index 0) and masked-out slots are dropped.  Codes missing from
     ``index_to_code`` render as ``UNKNOWN_CODE_{idx}`` rather than raising — a vocab-mapping
@@ -123,44 +118,34 @@ def events_from_jnrt_dense(
 
     Examples:
         >>> dense = {
-        ...     "time_delta_days": np.array([np.nan, 12.0, 33.0]),
         ...     "code": np.array([[3, 4], [5, 0], [6, 0]]),
         ...     "numeric_value": np.array([[np.nan, 7.2], [np.nan, np.nan], [1.5, np.nan]]),
         ...     "dim1/mask": np.array([[True, True], [True, False], [True, False]]),
         ... }
         >>> idx2code = {3: "ICD//E11.9", 4: "LAB//HbA1c", 5: "ICD//I10", 6: "LAB//CR"}
         >>> for e in events_from_jnrt_dense(dense, idx2code):
-        ...     print(round(e.days_before_prediction, 1), [(m.code, m.numeric_value) for m in e.measurements])
-        -45.0 [('ICD//E11.9', None), ('LAB//HbA1c', 7.2)]
-        -33.0 [('ICD//I10', None)]
-        0.0 [('LAB//CR', 1.5)]
-
-        ``gap_days`` shifts every event back by the last-event → prediction-time gap:
-
-        >>> events_from_jnrt_dense(dense, idx2code, gap_days=5.0)[-1].days_before_prediction
-        -5.0
+        ...     print([(m.code, m.numeric_value) for m in e.measurements])
+        [('ICD//E11.9', None), ('LAB//HbA1c', 7.2)]
+        [('ICD//I10', None)]
+        [('LAB//CR', 1.5)]
 
         Empty input yields no events:
 
         >>> events_from_jnrt_dense(
-        ...     {"time_delta_days": np.array([]), "code": np.zeros((0, 1)),
+        ...     {"code": np.zeros((0, 1)),
         ...      "numeric_value": np.zeros((0, 1)), "dim1/mask": np.zeros((0, 1), dtype=bool)},
         ...     idx2code,
         ... )
         []
     """
-    time_deltas = np.nan_to_num(np.asarray(dense["time_delta_days"], dtype=float).reshape(-1), nan=0.0)
-    n_events = len(time_deltas)
+    codes = np.atleast_2d(np.asarray(dense["code"]))
+    n_events = codes.shape[0]
     if n_events == 0:
         return []
 
-    codes = np.atleast_2d(np.asarray(dense["code"]))
     numeric_values = np.atleast_2d(np.asarray(dense["numeric_value"], dtype=float))
     mask = dense.get("dim1/mask")
     mask = np.ones_like(codes, dtype=bool) if mask is None else np.atleast_2d(np.asarray(mask, dtype=bool))
-
-    cum_days = np.cumsum(time_deltas)
-    total_days = cum_days[-1]
 
     events: list[Event] = []
     for i in range(n_events):
@@ -177,7 +162,7 @@ def events_from_jnrt_dense(
                 )
             )
         if measurements:
-            events.append(Event(float(cum_days[i] - total_days - gap_days), tuple(measurements)))
+            events.append(Event(tuple(measurements)))
     return events
 
 
@@ -233,21 +218,21 @@ def serialize_history(
 
     Keeps the most recent ``max_events`` events (truncating from the left) and, when
     truncation occurs, prepends a marker line noting how many earlier events were dropped.
-    Each measurement gets its own line, tagged with its event's (integer-rounded) days
-    before prediction time; ``numeric_value`` is appended after a colon only where present.
+    Each measurement gets its own line; ``numeric_value`` is appended after a colon only
+    where present.
 
     Examples:
         >>> events = [
-        ...     Event(-45.0, (Measurement("ICD//E11.9"), Measurement("LAB//HbA1c", 7.2))),
-        ...     Event(-33.0, (Measurement("ICD//I10"),)),
-        ...     Event(0.0, (Measurement("LAB//CR", 1.5),)),
+        ...     Event((Measurement("ICD//E11.9"), Measurement("LAB//HbA1c", 7.2))),
+        ...     Event((Measurement("ICD//I10"),)),
+        ...     Event((Measurement("LAB//CR", 1.5),)),
         ... ]
         >>> print(serialize_history(events, max_events=10).text)
         Patient history (most recent last):
-        - [-45d] ICD//E11.9
-        - [-45d] LAB//HbA1c: 7.2
-        - [-33d] ICD//I10
-        - [0d] LAB//CR: 1.5
+        - ICD//E11.9
+        - LAB//HbA1c: 7.2
+        - ICD//I10
+        - LAB//CR: 1.5
 
         Truncation keeps the most recent events and prepends a marker:
 
@@ -255,8 +240,8 @@ def serialize_history(
         >>> print(h.text)
         Patient history (most recent last):
         [1 earlier event omitted]
-        - [-33d] ICD//I10
-        - [0d] LAB//CR: 1.5
+        - ICD//I10
+        - LAB//CR: 1.5
         >>> h.n_events_total, h.n_events_dropped, h.truncated
         (3, 1, True)
 
@@ -265,7 +250,7 @@ def serialize_history(
         >>> print(serialize_history(events[1:2], max_events=10,
         ...     code_descriptions={"ICD//I10": "Essential hypertension"}).text)
         Patient history (most recent last):
-        - [-33d] ICD//I10 (Essential hypertension)
+        - ICD//I10 (Essential hypertension)
 
         An empty history renders a placeholder rather than an empty block:
 
@@ -281,13 +266,12 @@ def serialize_history(
     if n_dropped:
         lines.append(TRUNCATION_LINE.format(n=n_dropped, noun="event" if n_dropped == 1 else "events"))
     for event in kept:
-        days = f"{round(event.days_before_prediction)}"
         for m in event.measurements:
             code = _render_code(m.code, code_descriptions)
             if m.numeric_value is None:
-                lines.append(EVENT_LINE.format(days=days, code=code))
+                lines.append(EVENT_LINE.format(code=code))
             else:
-                lines.append(EVENT_LINE_WITH_VALUE.format(days=days, code=code, value=f"{m.numeric_value:g}"))
+                lines.append(EVENT_LINE_WITH_VALUE.format(code=code, value=f"{m.numeric_value:g}"))
     if not kept:
         lines.append(EMPTY_HISTORY_LINE)
 
@@ -319,10 +303,10 @@ def build_user_prompt(history_text: str, question: str) -> str:
     :data:`SYSTEM_PROMPT`, sent separately by the caller.
 
     Examples:
-        >>> print(build_user_prompt("Patient history (most recent last):\\n- [0d] HR: 88",
+        >>> print(build_user_prompt("Patient history (most recent last):\\n- HR: 88",
         ...                         "Question: Will code TEMP occur within 30 days?"))
         Patient history (most recent last):
-        - [0d] HR: 88
+        - HR: 88
         <BLANKLINE>
         Question: Will code TEMP occur within 30 days?
         Answer with exactly one word: Yes or No.
