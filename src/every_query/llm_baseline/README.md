@@ -96,6 +96,44 @@ Then evaluate exactly as for `EQ_predict` output:
 EQ_evaluate predictions_parquet=/path/to/out/predictions.parquet metrics_parquet=/path/to/metrics.parquet
 ```
 
+## Hosted APIs (OpenAI) and SLURM
+
+Nothing here is vLLM-specific except `guided_choice`, so the same CLI drives a hosted
+OpenAI-compatible endpoint. Point `base_url` at it, supply a real `api_key`, and turn
+guided decoding off:
+
+```bash
+EQ_llm_predict … \
+    base_url=https://api.openai.com/v1 \
+    api_key="$OPENAI_API_KEY" \
+    model=<chat-model-with-n-support> \
+    guided_choice=false \
+    max_concurrency=4
+```
+
+Two constraints on model choice. The method needs `n > 1` on chat completions (all samples
+come from one `n`-way request), and it needs `temperature > 0` — which rules out
+reasoning/o-series endpoints, and conveniently means any model that satisfies the first
+constraint also accepts `max_tokens`/`temperature`/`seed` as sent. With `guided_choice=false`
+the leading Yes/No word is parsed leniently, so watch `n_unparsed` in `details.parquet`: it is
+structurally zero under guided decoding and will not be here.
+
+Size `max_concurrency` to your rate-limit tier — exhausting `max_retries` on 429s aborts the
+run by design (transport failures are never written as fallback probabilities).
+
+A ready-to-edit CPU-only batch job lives at
+[`scripts/eq_llm_predict_openai.sbatch`](../../../scripts/eq_llm_predict_openai.sbatch) —
+no GPU, no model serving. All settings are inline in one `EDIT ME` block; the API key is
+read from a mode-600 file rather than the tracked script. It preflights egress to the API
+(compute nodes are often firewalled), and defaults `batch_size` low because the in-flight
+buffer is flushed on Ctrl-C but **not** on SLURM's time-limit `SIGTERM` — so `batch_size`
+bounds the rows whose API spend is lost to a timeout. `resume=true` makes it idempotent
+under `--requeue`.
+
+Do not run a job array against a single `output_dir`: there is no shard/offset knob, so every
+task would compute the same pending set and duplicate rows into `shards/`. Parallelize by
+splitting `tasks_dir` into separate `output_dir`s and merging afterward.
+
 ## Configuration reference
 
 All settings are Hydra overrides passed as `key=value` on the command line. Defaults and
@@ -115,8 +153,8 @@ at-a-glance version.
 
 | Key | Default | What it is |
 | --- | --- | --- |
-| `base_url` | `http://localhost:8000/v1` | OpenAI-compatible endpoint of your vLLM server. |
-| `api_key` | `EMPTY` | Ignored by vLLM; the `openai` SDK requires a non-empty value. |
+| `base_url` | `http://localhost:8000/v1` | OpenAI-compatible endpoint — your vLLM server, or a hosted API. |
+| `api_key` | `EMPTY` | Ignored by vLLM (the SDK just requires a non-empty value); a real key for hosted APIs. |
 | `model` | `meta-llama/Llama-3.1-8B-Instruct` | Served model name — must match what vLLM was launched with. |
 | `model_revision` | `null` | HF revision, recorded in metadata (not used to make requests). |
 
