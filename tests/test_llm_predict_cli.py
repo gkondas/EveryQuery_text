@@ -5,16 +5,15 @@ simple-static cohort ``demo_dataset`` builds on) plus a ``TaskQuerySchema``-conf
 tasks directory.  Covers:
 
 - the ``dry_run`` smoke path via the real console script (subprocess — no server contact);
-- the full in-process pipeline with a mocked OpenAI client (serialization → logprob
-  extraction → sharded ``PredictionSchema`` output → merge), verified to be consumable by
-  ``EQ_evaluate``'s ``compute_metrics`` unchanged;
+- the full in-process pipeline with a mocked OpenAI client (serialization → repeated Yes/No
+  sampling → empirical-fraction probability → sharded ``PredictionSchema`` output → merge),
+  verified to be consumable by ``EQ_evaluate``'s ``compute_metrics`` unchanged;
 - ``resume=true`` skipping already-completed rows.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import subprocess
 import sys
 from datetime import datetime
@@ -41,9 +40,10 @@ _SUBJECT_PRED_TIMES = {
 _QUERY_CODES = ["HR", "TEMP"]
 _DURATION_DAYS = 30.0
 
-_YES_LOGPROB = -0.2
-_NO_LOGPROB = -1.8
-_EXPECTED_PROB = 1.0 / (1.0 + math.exp(_NO_LOGPROB - _YES_LOGPROB))
+# Deterministic vote: the fake server answers Yes on _N_YES of every _N_SAMPLES samples.
+_N_SAMPLES = 4
+_N_YES = 3
+_EXPECTED_PROB = _N_YES / _N_SAMPLES
 
 
 @pytest.fixture(scope="module")
@@ -77,32 +77,23 @@ def _overrides(tasks_dir: Path, cohort_dir: Path, output_dir: Path, **extra) -> 
         "tensorized_cohort_dir": str(cohort_dir),
         "output_dir": str(output_dir),
         "split": "train",
+        "n_samples": _N_SAMPLES,
         **extra,
     }
     return [f"{key}={value}" for key, value in base.items()]
 
 
 class _FakeCompletions:
-    """Always answers Yes/No with fixed logprobs, shaped like the openai SDK response."""
+    """Returns an n-way completion of _N_YES 'Yes' + rest 'No', shaped like the openai SDK."""
 
     def __init__(self) -> None:
         self.n_calls = 0
 
     async def create(self, **kwargs):
         self.n_calls += 1
-        entries = [
-            SimpleNamespace(token="Yes", logprob=_YES_LOGPROB),
-            SimpleNamespace(token=" No", logprob=_NO_LOGPROB),
-        ]
-        first = SimpleNamespace(token="Yes", logprob=_YES_LOGPROB, top_logprobs=entries)
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="Yes"),
-                    logprobs=SimpleNamespace(content=[first]),
-                )
-            ]
-        )
+        n = kwargs.get("n", 1)
+        answers = ["Yes"] * min(_N_YES, n) + ["No"] * max(0, n - _N_YES)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=a)) for a in answers])
 
 
 def _run_main_with_fake_client(argv_overrides: list[str]) -> _FakeCompletions:
@@ -148,7 +139,7 @@ def test_llm_predict_full_run_and_resume(tensorized_cohort_dir, llm_tasks_dir, t
 
     n_tasks = len(_SUBJECT_PRED_TIMES) * len(_QUERY_CODES)
     assert predictions.height == n_tasks
-    # Every mocked answer softmaxes to the same Yes probability; censor_prob is constant 0.
+    # Every row votes the same way, so the empirical fraction is constant; censor_prob is 0.
     assert predictions["occurs_prob"].to_list() == pytest.approx([_EXPECTED_PROB] * n_tasks)
     assert predictions["censor_prob"].to_list() == [0.0] * n_tasks
     # boolean_value round-trips (one null / censored row among the four).
@@ -158,16 +149,18 @@ def test_llm_predict_full_run_and_resume(tensorized_cohort_dir, llm_tasks_dir, t
     metrics = compute_metrics(predictions)
     assert metrics.height == predictions.select("query", "duration_days").unique().height
 
-    # Sidecar diagnostics: no parse failures with the well-behaved fake server.
+    # Sidecar diagnostics: vote counts recorded, no parse failures with the fake server.
     details = pl.read_parquet(output_dir / "details.parquet")
     assert details.height == n_tasks
     assert details["parse_failed"].sum() == 0
-    assert set(details["method_used"].to_list()) == {"logprob"}
+    assert set(details["n_yes"].to_list()) == {_N_YES}
+    assert set(details["n_no"].to_list()) == {_N_SAMPLES - _N_YES}
+    assert set(details["n_unparsed"].to_list()) == {0}
 
     # Reproducibility metadata is on the merged parquet.
     meta = json.loads(pq.read_schema(predictions_fp).metadata[b"every_query_llm_baseline"])
-    assert meta["method"] == "logprob"
-    assert meta["max_events"] == 200
+    assert meta["n_samples"] == _N_SAMPLES
+    assert meta["max_events"] == 256
     assert meta["code_descriptions_used"] is False
     assert len(meta["prompt_template_hash"]) == 16
 

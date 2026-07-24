@@ -13,8 +13,8 @@ Differences from ``EQ_predict`` worth knowing about:
   run's resolved config).
 - **Query-axis deduplication.**  A single ``(subject, prediction_time)`` commonly carries
   many ``(query, duration_days)`` pairs; the history is serialized exactly once per group
-  and reused across that group's queries.  Each query is still its own LLM request — one
-  probability per request keeps the logprob method clean.
+  and reused across that group's queries.  Each query is still its own LLM request (one
+  ``n``-way sampled completion → one empirical probability).
 - **Raw histories, not model inputs.**  ``EveryQueryPytorchDataset._seeded_getitem``
   prepends the query's vocab token to the sequence (a model-input convention); the baseline
   bypasses it via the base-class ``load_subject_data``, which also yields the full
@@ -31,13 +31,15 @@ Differences from ``EQ_predict`` worth knowing about:
   well-defined 0.5 for constant scores; ``occurs_auroc`` (the headline metric) drops
   censored rows before scoring and is unaffected.
 - **Sidecar diagnostics.**  ``PredictionSchema.align`` rejects extra columns, so per-row
-  ``parse_failed`` / ``method_used`` live in ``output_dir/details.parquet`` (and
-  ``details_shards/``), keyed by the same identifier columns.
+  ``parse_failed`` and the Yes/No/unparsed vote counts (``n_yes`` / ``n_no`` /
+  ``n_unparsed``) live in ``output_dir/details.parquet`` (and ``details_shards/``), keyed by
+  the same identifier columns.
 
 Reproducibility: every shard and the merged parquet carry a ``every_query_llm_baseline``
-key in their parquet metadata holding a JSON blob with the model name/revision, method,
-prompt-template hash, ``max_events``, whether code descriptions were used, seed, and a hash
-of the resolved config — a run is reconstructable from its output alone.
+key in their parquet metadata holding a JSON blob with the model name/revision, sampling
+config (``n_samples`` / ``temperature`` / ``smoothing`` / ``guided_choice``), prompt-template
+hash, ``max_events``, whether code descriptions were used, seed, and a hash of the resolved
+config — a run is reconstructable from its output alone.
 """
 
 import asyncio
@@ -59,7 +61,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from every_query.data.dataset import EveryQueryPytorchDataset
 from every_query.data.schema import TaskQuerySchema
-from every_query.llm_baseline.llm_predict import LLMPredictor, ProbabilityResult
+from every_query.llm_baseline.llm_predict import LLMPredictor, SampleResult
 from every_query.llm_baseline.serialize import (
     PROMPT_TEMPLATE_VERSION,
     SYSTEM_PROMPT,
@@ -105,15 +107,16 @@ def _config_hash(cfg: DictConfig) -> str:
 _FINGERPRINT_FIELDS = (
     "model",
     "model_revision",
-    "method",
     "prompt_template_version",
     "prompt_template_hash",
     "max_events",
     "code_descriptions_used",
     "code_descriptions_path",
-    "seed",
+    "n_samples",
     "temperature",
-    "top_logprobs",
+    "smoothing",
+    "guided_choice",
+    "seed",
     "fallback_prob",
     "extra_body",
 )
@@ -124,15 +127,16 @@ def _run_payload(cfg: DictConfig) -> dict:
     payload = {
         "model": cfg.model,
         "model_revision": cfg.model_revision,
-        "method": cfg.method,
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "prompt_template_hash": prompt_template_hash(),
         "max_events": int(cfg.max_events),
         "code_descriptions_used": cfg.code_descriptions is not None,
         "code_descriptions_path": cfg.code_descriptions,
-        "seed": int(cfg.seed),
+        "n_samples": int(cfg.n_samples),
         "temperature": float(cfg.temperature),
-        "top_logprobs": int(cfg.top_logprobs),
+        "smoothing": float(cfg.smoothing),
+        "guided_choice": bool(cfg.guided_choice),
+        "seed": int(cfg.seed),
         "fallback_prob": None if cfg.fallback_prob is None else float(cfg.fallback_prob),
         "extra_body": None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
     }
@@ -243,7 +247,7 @@ class _ShardedWriter:
     Each flush writes one parquet per directory via a ``.tmp`` sibling + atomic rename, so a crash mid-write
     never leaves a half-written ``.parquet`` to corrupt a later ``resume`` scan.  Prediction shards are
     ``PredictionSchema.align``-ed and carry the run-metadata blob; the sidecar carries the same identifier
-    columns plus ``occurs_prob``, ``parse_failed``, and ``method_used``.
+    columns plus ``occurs_prob``, ``parse_failed``, and the Yes/No/unparsed vote counts.
     """
 
     def __init__(
@@ -273,7 +277,7 @@ class _ShardedWriter:
         pq.write_table(table, tmp)
         tmp.replace(target)
 
-    def flush(self, results: list[tuple[int, ProbabilityResult]]) -> None:
+    def flush(self, results: list[tuple[int, SampleResult]]) -> None:
         """Write one prediction shard + one details shard for ``(row_idx, result)`` pairs."""
         if not results:
             return
@@ -297,7 +301,9 @@ class _ShardedWriter:
                         [res.prob for _, res in results], dtype=pl.Float32
                     ),
                     "parse_failed": [res.parse_failed for _, res in results],
-                    "method_used": [res.method_used for _, res in results],
+                    "n_yes": [res.n_yes for _, res in results],
+                    "n_no": [res.n_no for _, res in results],
+                    "n_unparsed": [res.n_unparsed for _, res in results],
                 }
             )
         )
@@ -353,7 +359,6 @@ def _print_dry_run_prompts(
     serializer: _HistorySerializer,
     identifiers: pl.DataFrame,
     pending: list[int],
-    method: str,
     code_descriptions: dict[str, str] | None,
     n_prompts: int = 3,
 ) -> None:
@@ -378,7 +383,7 @@ def _print_dry_run_prompts(
             f"prediction_time={prediction_time}) ---"
         )
         print(f"[system]\n{SYSTEM_PROMPT}\n")
-        print(f"[user]\n{build_user_prompt(history.text, question, method)}")
+        print(f"[user]\n{build_user_prompt(history.text, question)}")
         shown += 1
         if shown >= n_prompts:
             break
@@ -414,7 +419,7 @@ async def _run_async(
     n_workers = int(cfg.max_concurrency)
     shard_size = int(cfg.batch_size)
     queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue(maxsize=max(2 * n_workers, 32))
-    buffer: list[tuple[int, ProbabilityResult]] = []
+    buffer: list[tuple[int, SampleResult]] = []
 
     async def producer() -> None:
         for row_idxs in _group_pending_rows(identifiers, pending):
@@ -511,7 +516,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     if cfg.dry_run:
-        _print_dry_run_prompts(serializer, identifiers, pending, cfg.method, code_descriptions)
+        _print_dry_run_prompts(serializer, identifiers, pending, code_descriptions)
         return
 
     payload = _run_payload(cfg)
@@ -522,13 +527,14 @@ def main(cfg: DictConfig) -> None:
         base_url=cfg.base_url,
         api_key=cfg.api_key,
         model=cfg.model,
-        method=cfg.method,
+        n_samples=int(cfg.n_samples),
         temperature=float(cfg.temperature),
+        smoothing=float(cfg.smoothing),
+        guided_choice=bool(cfg.guided_choice),
         seed=int(cfg.seed),
         max_concurrency=int(cfg.max_concurrency),
         max_retries=int(cfg.max_retries),
         request_timeout=float(cfg.request_timeout),
-        top_logprobs=int(cfg.top_logprobs),
         fallback_prob=0.5 if cfg.fallback_prob is None else float(cfg.fallback_prob),
         extra_body=None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
     )
@@ -550,8 +556,8 @@ def main(cfg: DictConfig) -> None:
         )
     logger.info(
         f"Completed {writer.n_rows_written} rows in {elapsed:.1f}s "
-        f"({predictor.n_requests} requests, {predictor.n_guided_fallbacks} guided fallbacks, "
-        f"{predictor.n_parse_failures} parse failures)"
+        f"({predictor.n_requests} requests, {predictor.n_parse_failures} parse failures, "
+        f"{predictor.n_unparsed_samples} unparsed samples)"
     )
 
     n_merged = _merge_shards(shards_dir, output_dir / "predictions.parquet", metadata)

@@ -49,8 +49,7 @@ EMPTY_HISTORY_LINE = "- (no prior events recorded)"
 EVENT_LINE = "- [{days}d] {code}"
 EVENT_LINE_WITH_VALUE = "- [{days}d] {code}: {value}"
 QUESTION_LINE = "Question: Will code {code} occur within {days} days?"
-LOGPROB_INSTRUCTION = "Answer with exactly one word: Yes or No."
-GUIDED_INSTRUCTION = "Answer with a single number: the probability (between 0 and 1) that this event occurs."
+YESNO_INSTRUCTION = "Answer with exactly one word: Yes or No."
 
 
 def prompt_template_hash() -> str:
@@ -77,8 +76,7 @@ def prompt_template_hash() -> str:
         EVENT_LINE,
         EVENT_LINE_WITH_VALUE,
         QUESTION_LINE,
-        LOGPROB_INSTRUCTION,
-        GUIDED_INSTRUCTION,
+        YESNO_INSTRUCTION,
     ]
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
@@ -312,39 +310,27 @@ def serialize_question(
     return QUESTION_LINE.format(code=_render_code(query_code, code_descriptions), days=f"{duration_days:g}")
 
 
-def build_user_prompt(history_text: str, question: str, method: str) -> str:
-    """Assemble the full user-turn prompt for the given probability-extraction ``method``.
+def build_user_prompt(history_text: str, question: str) -> str:
+    """Assemble the full user-turn prompt.
 
-    ``logprob`` appends the one-word Yes/No instruction; ``guided`` appends the numeric
-    instruction.  The system turn is :data:`SYSTEM_PROMPT`, sent separately by the caller.
+    Appends the one-word Yes/No instruction; the model is sampled repeatedly (see
+    :class:`~every_query.llm_baseline.llm_predict.LLMPredictor`) and the empirical fraction
+    of ``Yes`` answers is used as the occurrence probability.  The system turn is
+    :data:`SYSTEM_PROMPT`, sent separately by the caller.
 
     Examples:
         >>> print(build_user_prompt("Patient history (most recent last):\\n- [0d] HR: 88",
-        ...                         "Question: Will code TEMP occur within 30 days?", "logprob"))
+        ...                         "Question: Will code TEMP occur within 30 days?"))
         Patient history (most recent last):
         - [0d] HR: 88
         <BLANKLINE>
         Question: Will code TEMP occur within 30 days?
         Answer with exactly one word: Yes or No.
 
-        >>> build_user_prompt("h", "q", "guided").endswith(GUIDED_INSTRUCTION)
+        >>> build_user_prompt("h", "q").endswith(YESNO_INSTRUCTION)
         True
-
-        >>> build_user_prompt("h", "q", "freeform")
-        Traceback (most recent call last):
-            ...
-        ValueError: Unknown probability-extraction method 'freeform'; expected 'logprob' or 'guided'.
     """
-    match method:
-        case "logprob":
-            instruction = LOGPROB_INSTRUCTION
-        case "guided":
-            instruction = GUIDED_INSTRUCTION
-        case _:
-            raise ValueError(
-                f"Unknown probability-extraction method {method!r}; expected 'logprob' or 'guided'."
-            )
-    return f"{history_text}\n\n{question}\n{instruction}"
+    return f"{history_text}\n\n{question}\n{YESNO_INSTRUCTION}"
 
 
 # ── Code descriptions ────────────────────────────────────────────────────────────────────

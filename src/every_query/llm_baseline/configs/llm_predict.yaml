@@ -18,8 +18,9 @@ tasks_dir: ???
 tensorized_cohort_dir: ???
 
 # Required: output directory.  Completed rows stream to {output_dir}/shards/ (plus a
-# details_shards/ sidecar carrying parse_failed / method_used); on completion the shards
-# are merged into {output_dir}/predictions.parquet and {output_dir}/details.parquet.
+# details_shards/ sidecar carrying parse_failed and the Yes/No/unparsed vote counts); on
+# completion the shards are merged into {output_dir}/predictions.parquet and
+# {output_dir}/details.parquet.
 output_dir: ???
 
 # Which tensorized-cohort split the task subjects live in.  Same convention as EQ_predict.
@@ -37,22 +38,28 @@ model: meta-llama/Llama-3.1-8B-Instruct
 # server owns the weights) — recorded in the output parquet metadata for reproducibility.
 model_revision: null
 
-# ── Probability extraction ──────────────────────────────────────────────────────────────
+# ── Probability extraction (repeated-sampling vote) ─────────────────────────────────────
 
-# "logprob" (default): one-token Yes/No answer, softmax over the two tokens' logprobs —
-#   continuous probabilities, no mode collapse.  Falls back to "guided" per-sample when
-#   neither token appears in the top-k.
-# "guided": free-text numeric answer constrained by vLLM guided_regex, then parsed.
-method: logprob
-# How many top token logprobs to request for the logprob method.
-top_logprobs: 20
-# Written on total parse failure.  null → 0.5.  Set explicitly to inject an external
-# estimate (e.g. training-split prevalence) — never computed from the evaluated split's own
-# labels, which would leak ground truth into predictions.  Failures are always flagged in
-# the details sidecar's parse_failed column — never silently coerced.
+# Number of Yes/No samples drawn per query (one n-way completion, so the patient history is
+# prefilled once and shared across all samples).  The empirical fraction of "Yes" answers is
+# the occurrence probability, so the score takes one of n_samples + 1 discrete values — more
+# samples buy finer resolution and lower variance at linear decode cost.
+n_samples: 20
+# Constrain each sampled answer to exactly "Yes" or "No" via vLLM guided decoding, so every
+# sample counts and there is nothing to parse-fail on.  Set false for servers without
+# guided_choice support (the leading Yes/No word is then parsed leniently instead).
+guided_choice: true
+# Symmetric Laplace prior on the Yes/No vote:  prob = (n_yes + s) / (n_yes + n_no + 2s).
+# 0.0 = raw empirical fraction.  A small positive value keeps the score off the exact 0/1
+# endpoints — irrelevant for AUROC (monotonic) but keeps log-loss / Brier finite downstream.
+smoothing: 0.0
+# Written on total parse failure (no sample produced a usable Yes/No).  null → 0.5.  Set
+# explicitly to inject an external estimate (e.g. training-split prevalence) — never computed
+# from the evaluated split's own labels, which would leak ground truth into predictions.
+# Failures are always flagged in the details sidecar's parse_failed column — never coerced.
 fallback_prob: null
 # Extra JSON fields merged into every request body (vLLM/OpenAI extensions).  Needed for
-# thinking-style models whose first token would otherwise be reasoning rather than Yes/No,
+# thinking-style models whose answer would otherwise be reasoning rather than Yes/No,
 # e.g. Qwen3.5:  extra_body='{chat_template_kwargs: {enable_thinking: false}}'
 extra_body: null
 
@@ -60,7 +67,7 @@ extra_body: null
 
 # Keep the most recent max_events events (unique timestamps); older ones are dropped with a
 # marker line.  Per-run truncation stats are logged.
-max_events: 200
+max_events: 256
 # Optional code → human-readable description mapping (.json dict, or .parquet with
 # code/description columns, e.g. a MEDS metadata/codes.parquet).  null renders raw codes —
 # keep as the on/off switch for the description ablation.
@@ -68,7 +75,10 @@ code_descriptions: null
 
 # ── Generation / execution ──────────────────────────────────────────────────────────────
 
-temperature: 0.0
+# Sampling temperature.  MUST be > 0 for the repeated-sampling vote — at 0 every sample is
+# identical and the probability collapses to 0 or 1 (construction raises when n_samples > 1
+# and temperature == 0).  0.7 is a reasonable default; worth sweeping.
+temperature: 0.7
 seed: 0
 # Concurrent in-flight requests to the local server (semaphore-bounded).
 max_concurrency: 16

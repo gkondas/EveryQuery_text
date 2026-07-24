@@ -111,7 +111,7 @@ def test_full_prompt_golden(fixture_dense):
     events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE, gap_days=75.0)
     history = serialize_history(events, max_events=10, code_descriptions=_DESCRIPTIONS)
     question = serialize_question("ICD//I50.9", 90.0, _DESCRIPTIONS)
-    prompt = build_user_prompt(history.text, question, "logprob")
+    prompt = build_user_prompt(history.text, question)
     assert prompt == (
         "Patient history (most recent last):\n"
         "- [-120d] ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"

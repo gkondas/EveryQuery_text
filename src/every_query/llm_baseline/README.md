@@ -29,6 +29,12 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
 Pin `--revision` when serving and record it via `model_revision=...` so the run metadata
 captures exactly which weights answered.
 
+> **Size `--max-model-len` to your prompts.** `max_events` counts unique timestamps, and a
+> single timestamp can expand to many code lines — so long histories (especially with
+> `code_descriptions` on) can exceed 16k tokens. If a prompt overflows the model length,
+> vLLM returns a 400 and the run aborts. Dry-run first (below) to eyeball prompt size, and
+> raise `--max-model-len` (e.g. `32768`, up to the model's native limit) if needed.
+
 ## Running
 
 Eyeball prompts first (no GPU / server contact):
@@ -65,32 +71,116 @@ EQ_llm_predict \
     resume=true
 ```
 
+Tuning the sampling knobs (finer resolution + code descriptions + a touch of smoothing):
+
+```bash
+EQ_llm_predict \
+    tasks_dir=/path/to/tasks \
+    tensorized_cohort_dir=/path/to/tensorized_cohort \
+    output_dir=/path/to/out \
+    model=meta-llama/Llama-3.1-8B-Instruct \
+    n_samples=40 \
+    temperature=0.8 \
+    smoothing=1.0 \
+    code_descriptions=/path/to/tensorized_cohort/metadata/codes.parquet
+```
+
+`n_samples=40` gives 41 score levels (vs 21 at the default 20); `temperature=0.8` spreads
+the vote; `smoothing=1.0` pulls scores off the exact 0/1 endpoints; `code_descriptions=`
+annotates raw codes. Leave `guided_choice=true` (the default) unless your server lacks vLLM
+guided decoding, in which case add `guided_choice=false`.
+
 Then evaluate exactly as for `EQ_predict` output:
 
 ```bash
 EQ_evaluate predictions_parquet=/path/to/out/predictions.parquet metrics_parquet=/path/to/metrics.parquet
 ```
 
-## Probability extraction
+## Configuration reference
 
-Two methods behind the `method` config field (see `llm_predict.py`):
+All settings are Hydra overrides passed as `key=value` on the command line. Defaults and
+inline comments live in [`configs/llm_predict.yaml`](configs/llm_predict.yaml); this is the
+at-a-glance version.
 
-- **`logprob` (default).** The model is instructed to answer with exactly one word — `Yes`
-  or `No` — and the top-20 logprobs of the first generated token are requested. The Yes/No
-  token logprobs (robust to leading-space / BPE-marker / casing variants) are softmaxed
-  pairwise into a continuous probability. This avoids the mode collapse of free-text
-  numeric answers. If only one of the two tokens appears in the top-k, the other side is
-  bounded by the smallest returned logprob; if neither appears, the sample falls back to
-  the guided method.
-- **`guided` (fallback / comparison).** Free-text numeric answer constrained with vLLM's
-  `guided_regex` structured output (`(0\.\d{1,4}|1\.0|0|1)`), then parsed.
+**Required** (no default — every run must set these three, plus `split`):
 
-On total parse failure the configured `fallback_prob` is written (default 0.5; set it
-explicitly to inject an externally-estimated prevalence — it is never computed from the
-evaluated split's labels, which would leak ground truth), and the row is flagged
-`parse_failed=True` in `details.parquet`. Transport failures (after bounded retries with
-exponential backoff) abort the run instead of writing fallbacks — restart with
-`resume=true`.
+| Key | What it is |
+| --- | --- |
+| `tasks_dir` | Directory of `TaskQuerySchema` parquets (same contract as `EQ_predict`). |
+| `tensorized_cohort_dir` | The tokenized/tensorized MEDS cohort (`EQ_process_data` output). |
+| `output_dir` | Where shards stream and the merged `predictions.parquet` / `details.parquet` land. |
+| `split` | Which cohort split the task subjects live in. Default `held_out`. |
+
+**LLM server:**
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `base_url` | `http://localhost:8000/v1` | OpenAI-compatible endpoint of your vLLM server. |
+| `api_key` | `EMPTY` | Ignored by vLLM; the `openai` SDK requires a non-empty value. |
+| `model` | `meta-llama/Llama-3.1-8B-Instruct` | Served model name — must match what vLLM was launched with. |
+| `model_revision` | `null` | HF revision, recorded in metadata (not used to make requests). |
+
+**Sampling / probability** (see the next section for the method):
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `n_samples` | `20` | Yes/No samples drawn per query; score has `n_samples + 1` levels. |
+| `temperature` | `0.7` | Sampling temperature. **Must be > 0** (see next section). |
+| `guided_choice` | `true` | Constrain each answer to exactly `Yes`/`No` via vLLM guided decoding. |
+| `smoothing` | `0.0` | Laplace prior on the vote; `0.0` = raw fraction. |
+| `fallback_prob` | `null` (→0.5) | Probability written on total parse failure. |
+| `extra_body` | `null` | Extra JSON merged into every request (e.g. disable thinking). |
+
+**Serialization** (the two ablation axes):
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `max_events` | `256` | Keep the most recent N unique timestamps; older dropped with a marker. |
+| `code_descriptions` | `null` | `.json` map or `.parquet` (`code`/`description`) to annotate raw codes. |
+
+**Execution / restarts:**
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `max_concurrency` | `16` | In-flight requests to the server (semaphore-bounded). |
+| `batch_size` | `500` | Completed rows per output shard flush. |
+| `request_timeout` | `120` | Per-request timeout (seconds). |
+| `max_retries` | `5` | Retry budget for transient transport errors (exp. backoff), then abort. |
+| `seed` | `0` | Sampling seed, recorded in metadata. |
+| `limit` | `null` | Cap rows processed (after resume filtering) — for smoke runs. |
+| `resume` | `false` | Skip rows already in `{output_dir}/shards/` instead of refusing to start. |
+| `dry_run` | `false` | Print ~3 serialized prompts and exit without contacting the server. |
+
+## Probability extraction (repeated-sampling vote)
+
+The model is instructed to answer with exactly one word — `Yes` or `No` — and is sampled
+`n_samples` times (default 20) at a non-zero `temperature` (default 0.7). The **empirical
+fraction of `Yes` answers** is the occurrence probability (see `llm_predict.py`). All samples
+come back from a single `n`-way completion, so the (long) patient-history prefix is prefilled
+once and shared across the samples.
+
+Notes worth knowing about:
+
+- **Temperature must be > 0.** At `temperature=0` every sample is identical and the
+  probability collapses to 0 or 1; construction raises when `n_samples > 1` and
+  `temperature == 0`.
+- **Resolution is discrete.** With `n` samples the score takes one of `n + 1` values, so more
+  samples buy finer resolution and lower Monte-Carlo variance at linear decode cost. For
+  AUROC the empirical fraction and its logit are interchangeable (the transform is monotonic).
+- **`guided_choice` (default on).** Each answer is constrained to exactly `Yes`/`No` via vLLM
+  guided decoding, so every sample counts and there is nothing to parse-fail on. Set
+  `guided_choice=false` for servers without that extension — the leading Yes/No word is then
+  parsed leniently, and any other output is counted as unparsed (excluded from the vote).
+- **`smoothing`** applies a symmetric Laplace prior `(n_yes + s) / (n_yes + n_no + 2s)`,
+  keeping the score off the exact 0/1 endpoints. `0.0` (default) is the raw fraction —
+  irrelevant for AUROC, but a small positive value keeps log-loss / Brier finite downstream.
+
+On total parse failure (no sample produced a usable Yes/No) the configured `fallback_prob` is
+written (default 0.5; set it explicitly to inject an externally-estimated prevalence — it is
+never computed from the evaluated split's labels, which would leak ground truth), and the row
+is flagged `parse_failed=True` in `details.parquet`, alongside the per-row `n_yes` / `n_no` /
+`n_unparsed` vote counts. Transport failures (after bounded retries with exponential backoff)
+abort the run instead of writing fallbacks — restart with `resume=true`.
 
 `censor_prob` is a constant `0.0`: censoring is a data artifact, not a clinical
 prediction. In `EQ_evaluate` this only affects the `censor_auroc` sanity metric, which
@@ -110,9 +200,10 @@ becomes a well-defined-but-uninformative 0.5 for constant scores; the headline
 ## Reproducibility
 
 Every shard and the merged `predictions.parquet` / `details.parquet` carry a JSON blob
-under the `every_query_llm_baseline` parquet metadata key: model name/revision, `method`,
-prompt-template version + hash, `max_events`, whether code descriptions were used, seed,
-temperature, and a hash of the resolved config. Read it back with:
+under the `every_query_llm_baseline` parquet metadata key: model name/revision, sampling
+config (`n_samples`, `temperature`, `smoothing`, `guided_choice`), prompt-template version +
+hash, `max_events`, whether code descriptions were used, seed, and a hash of the resolved
+config. Read it back with:
 
 ```python
 import json, pyarrow.parquet as pq
