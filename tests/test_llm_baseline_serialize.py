@@ -11,7 +11,6 @@ import pytest
 
 from every_query.llm_baseline.serialize import (
     Event,
-    Measurement,
     build_user_prompt,
     events_from_jnrt_dense,
     load_code_descriptions,
@@ -38,27 +37,21 @@ _DESCRIPTIONS = {
 def fixture_dense() -> dict[str, np.ndarray]:
     """Three events: (diabetes dx + HbA1c lab), (hypertension dx), (HbA1c lab)."""
     return {
-        # Present on real MTD output but ignored by serialization (time is carried by the
-        # TIMELINE//DELTA tokens in the stream, not rendered as a per-event tag).
-        "time_delta_days": np.array([np.nan, 12.0, 33.0]),
         "code": np.array([[3, 4], [5, 0], [4, 0]]),
-        "numeric_value": np.array([[np.nan, 7.2], [np.nan, np.nan], [7.9, np.nan]]),
         "dim1/mask": np.array([[True, True], [True, False], [True, False]]),
     }
 
 
-def test_events_from_jnrt_dense_grouping_and_values(fixture_dense):
+def test_events_from_jnrt_dense_grouping(fixture_dense):
     events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
-    # One Event per unique timestamp (row), measurements grouped within.
-    assert [len(e.measurements) for e in events] == [2, 1, 1]
-    assert [m.code for e in events for m in e.measurements] == [
+    # One Event per unique timestamp (row), codes grouped within.
+    assert [len(e.codes) for e in events] == [2, 1, 1]
+    assert [code for e in events for code in e.codes] == [
         "ICD//E11.9",
         "LAB//HbA1c",
         "ICD//I10",
         "LAB//HbA1c",
     ]
-    # numeric_value is None exactly where the input had NaN.
-    assert [m.numeric_value for e in events for m in e.measurements] == [None, 7.2, None, 7.9]
 
 
 def test_golden_history_without_descriptions(fixture_dense):
@@ -67,13 +60,14 @@ def test_golden_history_without_descriptions(fixture_dense):
     assert history.text == (
         "Patient history (most recent last):\n"
         "- ICD//E11.9\n"
-        "- LAB//HbA1c: 7.2\n"
+        "- LAB//HbA1c\n"
         "- ICD//I10\n"
-        "- LAB//HbA1c: 7.9"
+        "- LAB//HbA1c"
     )
     assert not history.truncated
     assert history.n_events_total == 3
-    # No None / nan ever appears in the text.
+    # Only bare code strings — no "code: value" z-score residual on any event line.
+    assert not any(line.startswith("- ") and ": " in line for line in history.text.splitlines())
     assert "None" not in history.text and "nan" not in history.text
 
 
@@ -83,9 +77,9 @@ def test_golden_history_with_descriptions(fixture_dense):
     assert history.text == (
         "Patient history (most recent last):\n"
         "- ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
-        "- LAB//HbA1c: 7.2\n"
+        "- LAB//HbA1c\n"
         "- ICD//I10 (Essential hypertension)\n"
-        "- LAB//HbA1c: 7.9"
+        "- LAB//HbA1c"
     )
 
 
@@ -93,7 +87,7 @@ def test_golden_history_truncation(fixture_dense):
     events = events_from_jnrt_dense(fixture_dense, _INDEX_TO_CODE)
     history = serialize_history(events, max_events=1)
     assert history.text == (
-        "Patient history (most recent last):\n[2 earlier events omitted]\n- LAB//HbA1c: 7.9"
+        "Patient history (most recent last):\n[2 earlier events omitted]\n- LAB//HbA1c"
     )
     assert history.truncated
     assert (history.n_events_total, history.n_events_dropped) == (3, 2)
@@ -116,9 +110,9 @@ def test_full_prompt_golden(fixture_dense):
     assert prompt == (
         "Patient history (most recent last):\n"
         "- ICD//E11.9 (Type 2 diabetes mellitus without complications)\n"
-        "- LAB//HbA1c: 7.2\n"
+        "- LAB//HbA1c\n"
         "- ICD//I10 (Essential hypertension)\n"
-        "- LAB//HbA1c: 7.9\n"
+        "- LAB//HbA1c\n"
         "\n"
         "Question: Will code ICD//I50.9 (Heart failure, unspecified) occur within 90 days?\n"
         "Answer with exactly one word: Yes or No."
@@ -127,7 +121,7 @@ def test_full_prompt_golden(fixture_dense):
 
 def test_unknown_code_index_renders_marker(fixture_dense):
     events = events_from_jnrt_dense(fixture_dense, {})
-    assert events[0].measurements[0].code == "UNKNOWN_CODE_3"
+    assert events[0].codes[0] == "UNKNOWN_CODE_3"
 
 
 def test_prompt_template_hash_is_stable_and_short():
@@ -136,9 +130,9 @@ def test_prompt_template_hash_is_stable_and_short():
 
 
 def test_events_are_immutable():
-    event = Event((Measurement("HR", 88.0),))
+    event = Event(("HR",))
     with pytest.raises(AttributeError):
-        event.measurements = ()
+        event.codes = ()
 
 
 def test_load_code_descriptions_rejects_unknown_suffix(tmp_path):
