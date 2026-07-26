@@ -24,6 +24,12 @@ def class_counts(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def pick_tasks(df: pl.DataFrame, n_tasks: int, seed: int = 0) -> pl.DataFrame:
+    """Keep a random ``n_tasks`` distinct (query, duration_days) tuples; all of them if fewer exist."""
+    tasks = df.select(TASK).unique()
+    return df.join(tasks.sample(n=min(n_tasks, tasks.height), seed=seed), on=TASK, how="semi")
+
+
 def subsample(df: pl.DataFrame, per_class: int = 250, seed: int = 0, min_per_class: int = 0) -> pl.DataFrame:
     """Randomly keep up to ``per_class`` rows per (query, duration_days, boolean_value) group.
 
@@ -60,11 +66,21 @@ def main() -> None:
         default=0,
         help="drop tasks with fewer than this many positives or negatives (default 0 = keep all)",
     )
+    p.add_argument(
+        "--n-tasks",
+        type=int,
+        default=0,
+        help="keep only this many random (query, duration_days) tasks (default 0 = keep all)",
+    )
     args = p.parse_args()
 
     # a TASKS_DIR of shards is as common an input here as a single file
     df = pl.read_parquet(args.input / "**/*.parquet" if args.input.is_dir() else args.input)
     out = subsample(df, args.per_class, args.seed, args.min_per_class)
+    # after the per-class sampling, not before, so a --n-tasks run is a strict row-subset
+    # of the full run at the same --seed
+    if args.n_tasks:
+        out = pick_tasks(out, args.n_tasks, args.seed)
     out.write_parquet(args.output)
 
     counts = class_counts(out)
@@ -104,6 +120,12 @@ def _selfcheck() -> None:
     both = pl.concat([df, thin])
     assert subsample(both, per_class=2, seed=1).filter(pl.col("query") == "C").height == 3
     assert subsample(both, per_class=2, seed=1, min_per_class=2).filter(pl.col("query") == "C").height == 0
+
+    full = subsample(both, per_class=2, seed=1)
+    one = pick_tasks(full, 1, seed=1)
+    assert one.select(TASK).n_unique() == 1
+    assert one.join(full, on=one.columns, how="semi").height == one.height  # strict subset
+    assert pick_tasks(full, 99, seed=1).height == full.height  # asking for more than exist is fine
     print("ok")
 
 

@@ -29,6 +29,11 @@ export INPUT="/users/gbk2114/mimic-eq/eval_tasks/eval/held_out"
 # Output: a single parquet FILE (its parent directory is created below).
 export OUTPUT_FILE="/users/gbk2114/mimic-eq/eval_tasks_500/eval/held_out/tasks.parquet"
 
+# Second output: same sampling, cut down to N_TASKS random (query, duration_days) tasks.
+# At the same SEED this is a strict row-subset of OUTPUT_FILE. Set N_TASKS=0 to skip it.
+export OUTPUT_FILE_SMALL="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out/tasks.parquet"
+export N_TASKS=20
+
 # Rows kept per label per task — 250 + 250 = 500 patients per task.
 export PER_CLASS=250
 
@@ -54,5 +59,17 @@ uv run scripts/subsample_tasks.py \
     --per-class "$PER_CLASS" \
     --min-per-class "$MIN_PER_CLASS" \
     --seed "$SEED"
+
+if [[ "$N_TASKS" -gt 0 ]]; then
+    echo "--- ${N_TASKS}-task subset ---"
+    mkdir -p "$(dirname "$OUTPUT_FILE_SMALL")"
+    uv run scripts/subsample_tasks.py \
+        "$INPUT" \
+        "$OUTPUT_FILE_SMALL" \
+        --per-class "$PER_CLASS" \
+        --min-per-class "$MIN_PER_CLASS" \
+        --seed "$SEED" \
+        --n-tasks "$N_TASKS"
+fi
 
 echo "finished=$(date -Is)"
