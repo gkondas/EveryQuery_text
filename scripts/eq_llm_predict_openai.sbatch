@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eq-llm-openai
-#SBATCH --partition=cpu
+#SBATCH --partition=FILL-IN
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
