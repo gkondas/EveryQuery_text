@@ -121,7 +121,7 @@ l4h:
   # {RECORD_TIME_LIST} rendering:
   #   index        `0, 1, 2, 3`  (reproduces their MIMIC prompts)
   #   days_before  `3.5 days before prediction, ...`  (carries the stream's irregular spacing)
-  record_time_mode: index
+  record_time_mode: days_before
   # How the answer is extracted:
   #   float   parse a probability out of each sample and average — their format.  n_samples=1
   #           reproduces their single-shot `float(result)` exactly.

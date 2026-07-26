@@ -59,6 +59,10 @@ export L4H_PANEL="mimic_icu17"
 export L4H_FORM="string"          # string | list | batches
 export L4H_IMPUTE="locf"          # none | locf | locf_marked
 export L4H_MAX_VISITS=48
+# index reproduces the reference prompts (`0, 1, 2`) but tells the model nothing about
+# spacing; days_before renders each visit's real distance from the prediction time, which a
+# MEDS window has and their resampled ICU panels do not.
+export L4H_RECORD_TIME_MODE="days_before"   # index | days_before
 
 # ─── END EDIT ME ────────────────────────────────────────────────────────────────────────
 
@@ -73,6 +77,7 @@ extra_args=()
 if [[ "$PROMPT_STYLE" == "llm4healthcare" ]]; then
     extra_args+=("l4h.panel=$L4H_PANEL" "l4h.form=$L4H_FORM" "l4h.impute=$L4H_IMPUTE")
     extra_args+=("l4h.max_visits=$L4H_MAX_VISITS")
+    extra_args+=("l4h.record_time_mode=$L4H_RECORD_TIME_MODE")
 else
     extra_args+=("max_events=$MAX_EVENTS")
     [[ -n "$CODE_DESCRIPTIONS" ]] && extra_args+=("code_descriptions=$CODE_DESCRIPTIONS")
