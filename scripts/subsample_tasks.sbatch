@@ -37,9 +37,10 @@ export N_TASKS=20
 # Rows kept per label per task — 250 + 250 = 500 patients per task.
 export PER_CLASS=250
 
-# Drop tasks that can't field this many in EITHER class. 0 keeps every task, however
-# thin and however imbalanced. Raise it to guarantee a floor per class.
-export MIN_PER_CLASS=0
+# Drop tasks that can't field this many in EITHER class. 1 drops the degenerate
+# single-class tasks (zero positives or zero negatives — no AUROC, nothing to learn);
+# 0 keeps every task however thin. Raise it for a real floor per class.
+export MIN_PER_CLASS=1
 
 # Change to re-draw a different random sample.
 export SEED=0
