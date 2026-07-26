@@ -309,6 +309,12 @@ class LLMPredictor:
                         sum(parsed) / len(parsed), 0, 0, n_unparsed, False, n_parsed=len(parsed)
                     )
                 self.n_parse_failures += 1
+                # A total float failure means no sample contained even a digit, which is almost
+                # always the answer being empty or truncated rather than a bad number.  Nothing
+                # else records the raw completion, so echo the first few — otherwise a run that
+                # fails on every row gives you nothing to debug from.
+                if self.n_parse_failures <= 3:
+                    logger.warning(f"float parse failure, raw completions: {contents!r}")
                 return SampleResult(fb, 0, 0, n_unparsed, parse_failed=True, n_parsed=0)
 
             n_yes, n_no, n_unparsed = self._tally_yes_no(contents)
