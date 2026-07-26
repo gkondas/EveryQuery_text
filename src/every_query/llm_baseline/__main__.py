@@ -11,10 +11,20 @@ Differences from ``EQ_predict`` worth knowing about:
 - **No model run dir.**  There is no trained checkpoint; the dataset config is built
   directly from ``tensorized_cohort_dir`` (which ``EQ_predict`` recovers from the training
   run's resolved config).
+- **Two prompt styles.**  ``prompt_style=event_stream`` (default) renders EveryQuery's own
+  chronological code list with a Yes/No question; ``prompt_style=llm4healthcare`` reproduces
+  the feature-major panel prompt of https://github.com/yhzhu99/llm4healthcare and parses a
+  float probability.  Both implement
+  :class:`~every_query.llm_baseline.prompt_style.PromptStyle`, so everything below is shared.
+  Note the panel style places the query in the task-description paragraph near the *top* of
+  the prompt (that is where the reference template puts it), so rows in the same group no
+  longer share a token prefix and vLLM's automatic prefix caching cannot reuse the patient
+  block across a group's ~10-20 queries.  The event-stream style appends the query last and
+  does keep that prefix shared.
 - **Query-axis deduplication.**  A single ``(subject, prediction_time)`` commonly carries
   many ``(query, duration_days)`` pairs; the history is serialized exactly once per group
   and reused across that group's queries.  Each query is still its own LLM request (one
-  ``n``-way sampled completion → one empirical probability).
+  ``n``-way sampled completion → one probability).
 - **Raw histories, not model inputs.**  ``EveryQueryPytorchDataset._seeded_getitem``
   prepends the query's vocab token to the sequence (a model-input convention); the baseline
   bypasses it via the base-class ``load_subject_data``, which also yields the full
@@ -31,15 +41,17 @@ Differences from ``EQ_predict`` worth knowing about:
   well-defined 0.5 for constant scores; ``occurs_auroc`` (the headline metric) drops
   censored rows before scoring and is unaffected.
 - **Sidecar diagnostics.**  ``PredictionSchema.align`` rejects extra columns, so per-row
-  ``parse_failed`` and the Yes/No/unparsed vote counts (``n_yes`` / ``n_no`` /
-  ``n_unparsed``) live in ``output_dir/details.parquet`` (and ``details_shards/``), keyed by
-  the same identifier columns.
+  ``parse_failed`` and the sample counts (``n_yes`` / ``n_no`` / ``n_unparsed`` for the
+  Yes/No vote, ``n_parsed`` for float extraction) live in ``output_dir/details.parquet``
+  (and ``details_shards/``), keyed by the same identifier columns.
 
 Reproducibility: every shard and the merged parquet carry a ``every_query_llm_baseline``
 key in their parquet metadata holding a JSON blob with the model name/revision, sampling
-config (``n_samples`` / ``temperature`` / ``smoothing`` / ``guided_choice``), prompt-template
-hash, ``max_events``, whether code descriptions were used, seed, and a hash of the resolved
-config — a run is reconstructable from its output alone.
+config (``n_samples`` / ``temperature`` / ``smoothing`` / ``guided_choice``), the prompt
+style with its template hash and style-specific knobs (``style_fields`` — ``max_events`` and
+code descriptions for ``event_stream``; panel digest, form and imputation for
+``llm4healthcare``), seed, and a hash of the resolved config — a run is reconstructable from
+its output alone, and ``resume`` refuses to extend shards whose fingerprint differs.
 """
 
 import asyncio
@@ -62,17 +74,8 @@ from omegaconf import DictConfig, OmegaConf
 from every_query.data.dataset import EveryQueryPytorchDataset
 from every_query.data.schema import TaskQuerySchema
 from every_query.llm_baseline.llm_predict import LLMPredictor, SampleResult
-from every_query.llm_baseline.serialize import (
-    PROMPT_TEMPLATE_VERSION,
-    SYSTEM_PROMPT,
-    SerializedHistory,
-    build_user_prompt,
-    events_from_jnrt_dense,
-    load_code_descriptions,
-    prompt_template_hash,
-    serialize_history,
-    serialize_question,
-)
+from every_query.llm_baseline.prompt_style import PromptStyle, build_style
+from every_query.llm_baseline.serialize import SerializedHistory, load_code_descriptions
 from every_query.predict.predict import _identifiers_from_schema_df, _validate_tasks_dir
 from every_query.predict.schema import PredictionSchema
 
@@ -99,14 +102,16 @@ def _config_hash(cfg: DictConfig) -> str:
 # Metadata fields that determine per-row predictions.  ``resume`` refuses to extend shards
 # whose fingerprint over these fields differs from the current run's — identifier columns
 # alone can't tell a Qwen shard from a Llama shard.
+# ``style_fields`` holds the style-specific knobs (max_events / panel / form / …), which vary
+# by prompt_style and so cannot be enumerated statically; it is fingerprinted as a whole.
 _FINGERPRINT_FIELDS = (
     "model",
     "model_revision",
+    "prompt_style",
     "prompt_template_version",
     "prompt_template_hash",
-    "max_events",
-    "code_descriptions_used",
-    "code_descriptions_path",
+    "response_format",
+    "style_fields",
     "n_samples",
     "temperature",
     "smoothing",
@@ -117,16 +122,16 @@ _FINGERPRINT_FIELDS = (
 )
 
 
-def _run_payload(cfg: DictConfig) -> dict:
+def _run_payload(cfg: DictConfig, style: PromptStyle) -> dict:
     """Build the reproducibility payload recorded (as JSON) on every output file."""
     payload = {
         "model": cfg.model,
         "model_revision": cfg.model_revision,
-        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
-        "prompt_template_hash": prompt_template_hash(),
-        "max_events": int(cfg.max_events),
-        "code_descriptions_used": cfg.code_descriptions is not None,
-        "code_descriptions_path": cfg.code_descriptions,
+        "prompt_style": style.name,
+        "prompt_template_version": style.template_version,
+        "prompt_template_hash": style.template_hash(),
+        "response_format": style.response_format,
+        "style_fields": style.payload_fields(),
         "n_samples": int(cfg.n_samples),
         "temperature": float(cfg.temperature),
         "smoothing": float(cfg.smoothing),
@@ -178,42 +183,47 @@ class _HistorySerializer:
     """Serializes one ``(subject_id, prediction_time)`` group's history per call.
 
     Wraps the dataset's base-class ``load_subject_data`` (full untruncated pre-prediction window, no prepended
-    query token).  Callers are responsible for calling once per group and sharing the returned string across
-    that group's ``(query, duration_days)`` rows — no cache is kept here, so serialized histories are released
-    as soon as the caller drops them (memory stays bounded on large cohorts).  Tracks truncation stats for the
-    per-run log line.
+    query token) and hands the dense arrays to the configured :class:`PromptStyle`.  Callers are responsible
+    for calling once per group and sharing the returned string across that group's ``(query, duration_days)``
+    rows — no cache is kept here, so serialized histories are released as soon as the caller drops them
+    (memory stays bounded on large cohorts).  Tracks truncation and empty-history stats for the per-run log
+    line; under a panel style an "empty" history means the window held no measurement of any panel feature.
     """
 
     dataset: EveryQueryPytorchDataset
-    max_events: int
-    code_descriptions: dict[str, str] | None
+    style: PromptStyle
 
     def __post_init__(self) -> None:
         self._index_to_code = {idx: code for code, idx in self.dataset.code_to_index.items()}
         self.n_serialized = 0
         self.n_truncated = 0
+        self.n_empty = 0
 
     def history_for_row(self, row_idx: int) -> SerializedHistory:
         """Serialize the history for dataset row ``row_idx`` (call once per group)."""
         subject_id, end_idx = self.dataset.index[row_idx]
-        dynamic_data, _static = self.dataset.load_subject_data(subject_id=subject_id, st=0, end=end_idx)
-        events = events_from_jnrt_dense(dynamic_data.to_dense(), self._index_to_code)
-        history = serialize_history(
-            events, max_events=self.max_events, code_descriptions=self.code_descriptions
-        )
+        dynamic_data, static = self.dataset.load_subject_data(subject_id=subject_id, st=0, end=end_idx)
+        static_codes = list(static.code) if static is not None else None
+        history = self.style.history_from_dense(dynamic_data.to_dense(), static_codes, self._index_to_code)
         self.n_serialized += 1
         self.n_truncated += int(history.truncated)
+        self.n_empty += int(history.n_events_total == 0)
         return history
 
     def log_truncation_stats(self) -> None:
         if self.n_serialized == 0:
             return
-        fraction = self.n_truncated / self.n_serialized
         logger.info(
             f"Serialized {self.n_serialized} unique (subject, prediction_time) histories; "
-            f"{self.n_truncated} ({fraction:.1%}) were clipped to the most recent "
-            f"{self.max_events} events."
+            f"{self.n_truncated} ({self.n_truncated / self.n_serialized:.1%}) were truncated."
         )
+        if self.n_empty:
+            logger.warning(
+                f"{self.n_empty} of {self.n_serialized} histories "
+                f"({self.n_empty / self.n_serialized:.1%}) serialized to an empty record — under "
+                f"the 'llm4healthcare' style this means the window contained no measurement of "
+                f"any panel feature, so the model is asked to predict from demographics alone."
+            )
 
 
 class _ShardedWriter:
@@ -279,6 +289,7 @@ class _ShardedWriter:
                     "n_yes": [res.n_yes for _, res in results],
                     "n_no": [res.n_no for _, res in results],
                     "n_unparsed": [res.n_unparsed for _, res in results],
+                    "n_parsed": [res.n_parsed for _, res in results],
                 }
             )
         )
@@ -332,9 +343,9 @@ def _merge_shards(shards_dir: Path, out_fp: Path, metadata: dict[bytes, bytes]) 
 
 def _print_dry_run_prompts(
     serializer: _HistorySerializer,
+    style: PromptStyle,
     identifiers: pl.DataFrame,
     pending: list[int],
-    code_descriptions: dict[str, str] | None,
     n_prompts: int = 3,
 ) -> None:
     """Print fully serialized prompts for the first few distinct histories, then return."""
@@ -348,17 +359,14 @@ def _print_dry_run_prompts(
         seen_groups.add((subject_id, prediction_time))
 
         history = serializer.history_for_row(row_idx)
-        question = serialize_question(
-            identifiers[TaskQuerySchema.query_name][row_idx],
-            float(identifiers[TaskQuerySchema.duration_days_name][row_idx]),
-            code_descriptions,
-        )
+        query_code = identifiers[TaskQuerySchema.query_name][row_idx]
+        duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
         print(
             f"\n{'=' * 80}\n--- prompt {shown + 1} (subject={subject_id}, "
-            f"prediction_time={prediction_time}) ---"
+            f"prediction_time={prediction_time}, style={style.name}) ---"
         )
-        print(f"[system]\n{SYSTEM_PROMPT}\n")
-        print(f"[user]\n{build_user_prompt(history.text, question)}")
+        print(f"[system]\n{style.system_prompt()}\n")
+        print(f"[user]\n{style.user_prompt(history.text, query_code, duration)}")
         shown += 1
         if shown >= n_prompts:
             break
@@ -382,7 +390,6 @@ async def _run_async(
     identifiers: pl.DataFrame,
     pending: list[int],
     writer: _ShardedWriter,
-    code_descriptions: dict[str, str] | None,
 ) -> None:
     """Stream pending rows through a bounded queue of LLM workers, flushing shards as they finish.
 
@@ -409,8 +416,7 @@ async def _run_async(
             row_idx, history_text = item
             query = identifiers[TaskQuerySchema.query_name][row_idx]
             duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
-            question = serialize_question(query, duration, code_descriptions)
-            result = await predictor.predict_prob(history_text, question)
+            result = await predictor.predict_prob(history_text, query, duration)
             buffer.append((row_idx, result))
             if len(buffer) >= shard_size:
                 writer.flush(buffer)
@@ -451,12 +457,15 @@ def main(cfg: DictConfig) -> None:
     if code_descriptions is not None:
         logger.info(f"Loaded {len(code_descriptions)} code descriptions from {cfg.code_descriptions}")
 
+    # 'include' rather than 'omit': the llm4healthcare style renders the patient's sex from the
+    # GENDER//* static code.  The extra per-subject read is one short list column and the
+    # event_stream style simply ignores the returned statics.
     dataset_cfg = MEDSTorchDataConfig(
         tensorized_cohort_dir=str(cfg.tensorized_cohort_dir),
         task_labels_dir=str(tasks_dir),
         max_seq_len=int(cfg.max_events),  # unused by our load_subject_data path, but required
         seq_sampling_strategy="to_end",
-        static_inclusion_mode="omit",
+        static_inclusion_mode="include",
         batch_mode="SM",
     )
     dataset = EveryQueryPytorchDataset(dataset_cfg, split=cfg.split)
@@ -485,19 +494,19 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("0 rows pending — nothing to do")
 
-    serializer = _HistorySerializer(
-        dataset=dataset, max_events=int(cfg.max_events), code_descriptions=code_descriptions
-    )
+    style = build_style(cfg, code_descriptions)
+    serializer = _HistorySerializer(dataset=dataset, style=style)
 
     if cfg.dry_run:
-        _print_dry_run_prompts(serializer, identifiers, pending, code_descriptions)
+        _print_dry_run_prompts(serializer, style, identifiers, pending)
         return
 
-    payload = _run_payload(cfg)
+    payload = _run_payload(cfg, style)
     metadata = _run_metadata(payload)
     if cfg.resume:
         _validate_resume_fingerprint(shards_dir, payload)
     predictor = LLMPredictor(
+        style=style,
         base_url=cfg.base_url,
         api_key=cfg.api_key,
         model=cfg.model,
@@ -519,7 +528,7 @@ def main(cfg: DictConfig) -> None:
     writer = _ShardedWriter(identifiers, shards_dir, details_dir, metadata, run_id)
 
     t0 = time.perf_counter()
-    asyncio.run(_run_async(cfg, predictor, serializer, identifiers, pending, writer, code_descriptions))
+    asyncio.run(_run_async(cfg, predictor, serializer, identifiers, pending, writer))
     elapsed = time.perf_counter() - t0
 
     if predictor.n_parse_failures:

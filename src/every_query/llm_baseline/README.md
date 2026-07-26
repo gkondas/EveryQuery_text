@@ -96,6 +96,92 @@ Then evaluate exactly as for `EQ_predict` output:
 EQ_evaluate predictions_parquet=/path/to/out/predictions.parquet metrics_parquet=/path/to/metrics.parquet
 ```
 
+## Prompt styles
+
+`prompt_style` selects how a history becomes a prompt. Everything else — sharding, resume,
+metadata, output schema — is shared.
+
+### `event_stream` (default)
+
+EveryQuery's native format: the history as a chronological list of raw code strings, then
+`Question: Will code X occur within D days?` and a one-word Yes/No instruction. The
+probability is the empirical fraction of `Yes` over `n_samples` samples. Open-vocabulary —
+nothing is dropped except by `max_events` truncation.
+
+### `llm4healthcare`
+
+A faithful reproduction of the prompt from
+[yhzhu99/llm4healthcare](https://github.com/yhzhu99/llm4healthcare) ("Prompting Large Language
+Models for Zero-Shot Clinical Prediction with Structured Longitudinal EHR Data"), so results
+are directly comparable to that paper.
+
+```bash
+EQ_llm_predict \
+    tasks_dir=/path/to/tasks \
+    tensorized_cohort_dir=/path/to/tensorized_cohort \
+    output_dir=/path/to/out \
+    prompt_style=llm4healthcare \
+    l4h.form=string \
+    l4h.impute=locf \
+    n_samples=1 \
+    dry_run=true
+```
+
+Their prompt is **feature-major** over a small fixed panel of clinical variables — one line
+per feature, values comma-joined across visits — where a MEDS stream is event-major over an
+open vocabulary. Three properties of the tensorized cohort make that pivot exact:
+
+1. **The panel exists.** All 17 of their MIMIC variables appear in the cohort vocabulary as
+   `LAB//<itemid>//<unit>` codes. `panels/mimic_icu17.yaml` maps them, reproducing their
+   feature names, ordering, `unit.json` and `range.json` strings verbatim.
+2. **Values are recoverable.** Preprocessing bins numerics into the code string
+   (`LAB//220045//bpm//value_[90.0,96.0)`) and stores a *within-bin* z-score in
+   `numeric_value`. Since `metadata/codes.parquet` keeps per-binned-code `values/sum` and
+   `values/sum_sqd`, the original measurement comes back as `z * std_bin + mean_bin`. Per-bin
+   standard deviations are ~1–2 bpm for heart rate, so recovery is essentially exact and cells
+   render as real readings (`94.0`), not bin labels.
+3. **Visits are timestamps.** Their tjh prompts use irregular real dates, so one MEDS unique
+   timestamp = one visit needs no resampling.
+
+Demographics come from the `GENDER//*` static code and the `MEDS_BIRTH` event.
+
+**Where it deliberately deviates**, because no faithful transfer exists:
+
+- **Task/response strings.** Their tasks are mortality / length-of-stay / readmission;
+  EveryQuery asks whether an arbitrary code occurs within a horizon. Those two slots are
+  written fresh in their register. Everything else in the template is theirs verbatim — a test
+  asserts the rendering template is a pure refactor of their `USERPROMPT`.
+- **Categorical cells.** Their Glasgow-coma and capillary-refill cells hold MIMIC's text
+  labels ("Obeys Commands"); this cohort's preprocessing kept only the numeric subscore, so
+  those rows render as numbers. Capillary refill retains no value bins and renders as
+  `present`.
+- **FiO2 units.** MIMIC charts itemid 223835 as a percentage but their reference range is a
+  fraction ("more than 0.21"), so the panel applies the MIMIC benchmark's `fio2_fraction`
+  normalization.
+
+**Costs worth knowing before you run it.** The panel is lossy by design: on the MIMIC-IV demo
+cohort ~12% of prediction windows contain no measurement of *any* panel variable and render as
+a demographics-only prompt (the run logs this rate). The panel is also query-independent, so
+it never shows whether the query code occurred before — usually the strongest single predictor
+for this task. And because the query sits near the top of their template, rows sharing a
+patient no longer share a token prefix, so vLLM prefix caching cannot reuse the patient block
+across a group's queries.
+
+`l4h.response_format=float` (the default here) parses a probability per sample and averages;
+`n_samples=1` reproduces their single-shot `float(result)` exactly. Their own fallback constant
+of `0.501` reflects how often that parse fails — watch `parse_failed` in `details.parquet`.
+Set `l4h.response_format=yes_no` to keep their prompt but extract with the better-calibrated
+sampling vote (see `llm_predict.py` on why free-text floats mode-collapse).
+
+Few-shot examples go in `l4h.examples` as paths to `.txt` blocks. **Build them from the
+training split only** — an example drawn from the evaluated split leaks its label into every
+prompt.
+
+To target a different cohort or variable set, copy `panels/mimic_icu17.yaml` and point
+`l4h.panel` at it. Sources key on `itemid` (matching `PREFIX//<itemid>//…`) or on `code` (an
+exact match on the code string with any `//value_` suffix stripped) for cohorts without
+itemids.
+
 ## Hosted APIs (OpenAI) and SLURM
 
 Nothing here is vLLM-specific except `guided_choice`, so the same CLI drives a hosted

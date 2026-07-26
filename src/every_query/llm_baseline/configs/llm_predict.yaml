@@ -65,6 +65,19 @@ extra_body: null
 
 # ── Serialization ───────────────────────────────────────────────────────────────────────
 
+# Which prompt serialization to use:
+#   event_stream   — EveryQuery's native format: a chronological list of raw code strings
+#                    plus a Yes/No question.  Open-vocabulary; nothing about the history is
+#                    dropped except by max_events truncation.
+#   llm4healthcare — faithful reproduction of the prompt from
+#                    https://github.com/yhzhu99/llm4healthcare: feature-major rows over a
+#                    fixed clinical panel, with units, reference ranges and a float answer.
+#                    Lossy by construction (only panel variables are rendered) but directly
+#                    comparable to that paper.  Configured under `l4h` below.
+prompt_style: event_stream
+
+# ── event_stream style ──────────────────────────────────────────────────────────────────
+
 # Keep the most recent max_events events (unique timestamps); older ones are dropped with a
 # marker line.  Per-run truncation stats are logged.
 max_events: 256
@@ -72,6 +85,50 @@ max_events: 256
 # code/description columns, e.g. a MEDS metadata/codes.parquet).  null renders raw codes —
 # keep as the on/off switch for the description ablation.
 code_descriptions: null
+
+# ── llm4healthcare style ────────────────────────────────────────────────────────────────
+# Ignored unless prompt_style=llm4healthcare.  Names mirror that repo's `config` dict so its
+# published ablations can be reproduced directly.
+l4h:
+  # Feature panel: a bundled name (see llm_baseline/panels/) or a path to a .yaml.
+  # mimic_icu17 is their 17-variable MIMIC panel mapped onto this cohort's itemids.
+  panel: mimic_icu17
+  # How {DETAIL} lays out the feature x visit grid — their `form`:
+  #   string   - Heart Rate: "94.0, 88.0"      (their default)
+  #   list     - Heart Rate: [94.0, 88.0]
+  #   batches  Visit 1: / - Heart Rate: 94.0   (one block per visit)
+  form: string
+  # Missing-cell handling — their `impute`:
+  #   none        leave gaps as `nan`, and append their missing-value note   (their impute=0)
+  #   locf        forward-fill silently                                      (their impute=1)
+  #   locf_marked forward-fill, suffix filled cells `**`, append their note  (their impute=2)
+  impute: locf
+  # Include the per-feature "Unit: bpm." / "Reference range: 60 - 100." context block.
+  unit: true
+  reference_range: true
+  # Few-shot {EXAMPLE} blocks: paths to .txt files (or inline strings), rendered with their
+  # "Here are N examples of input information:" preamble.  [] = zero-shot.
+  # Build these from the TRAINING split only — an example drawn from the evaluated split
+  # leaks its label into every prompt.
+  examples: []
+  # Keep the most recent max_visits visits.  A visit is a timestamp carrying at least one
+  # panel measurement; windows in this cohort reach ~370, against the handful their
+  # pre-truncated ICU cohorts carry, so this cap is load-bearing for prompt length.
+  max_visits: 48
+  # Decimal places for rendered values.  Their prompts carry full float repr
+  # ("37.05555555555556"); 1 is far cheaper in tokens and clinically equivalent.
+  value_precision: 1
+  # {RECORD_TIME_LIST} rendering:
+  #   index        `0, 1, 2, 3`  (reproduces their MIMIC prompts)
+  #   days_before  `3.5 days before prediction, ...`  (carries the stream's irregular spacing)
+  record_time_mode: index
+  # How the answer is extracted:
+  #   float   parse a probability out of each sample and average — their format.  n_samples=1
+  #           reproduces their single-shot `float(result)` exactly.
+  #   yes_no  the repeated-sampling Yes/No vote used by the event_stream style, which is
+  #           better calibrated (see llm_predict.py's module docstring on mode collapse) but
+  #           is NOT the reference prompt.
+  response_format: float
 
 # ── Generation / execution ──────────────────────────────────────────────────────────────
 

@@ -31,17 +31,19 @@ from dataclasses import dataclass
 
 from openai import APIConnectionError, AsyncOpenAI, InternalServerError, RateLimitError
 
-from every_query.llm_baseline.serialize import SYSTEM_PROMPT, build_user_prompt
-
 logger = logging.getLogger(__name__)
 
 # vLLM structured-output constraint: force each sampled answer to be exactly one of these.
 YES_NO_CHOICES = ("Yes", "No")
 # Max tokens per sampled answer — "Yes"/"No" is 1-2 tokens; a small cap keeps sampling cheap.
 _ANSWER_MAX_TOKENS = 8
+# Float answers need room for "0.85" plus any stray leading whitespace/newline.
+_FLOAT_MAX_TOKENS = 16
 
 # Leading Yes/No word, case-insensitive, tolerating trailing punctuation / text.
 _YES_NO_RE = re.compile(r"\s*(yes|no)\b", re.IGNORECASE)
+# First float-looking token anywhere in the answer.
+_FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 # APITimeoutError subclasses APIConnectionError, so timeouts are covered by the first entry.
 _RETRYABLE_ERRORS = (APIConnectionError, RateLimitError, InternalServerError)
@@ -65,6 +67,9 @@ class SampleResult:
     n_no: int
     n_unparsed: int
     parse_failed: bool
+    #: Float-extraction mode only: how many samples yielded a usable probability.  Always 0
+    #: under the Yes/No vote, where ``n_yes + n_no`` carries the same information.
+    n_parsed: int = 0
 
 
 def parse_yes_no(text: str | None) -> str | None:
@@ -112,6 +117,36 @@ def empirical_probability(n_yes: int, n_no: int, smoothing: float = 0.0) -> floa
     return (n_yes + smoothing) / (total + 2.0 * smoothing)
 
 
+def parse_probability(text: str | None) -> float | None:
+    """Parse a free-text probability answer into ``[0, 1]``, or ``None`` if unusable.
+
+    Takes the first float-looking token anywhere in the answer and clamps it to the unit
+    interval.  The reference implementation this mode replicates calls bare ``float(result)``
+    and falls back on any exception; scanning for the first number is strictly more permissive
+    (it survives a stray newline or a trailing period) without changing the prompt, so fewer
+    usable answers are thrown away.
+
+    Examples:
+        >>> [parse_probability(t) for t in ["0.85", " 0.3\\n", "0.75.", "Probability: 0.2"]]
+        [0.85, 0.3, 0.75, 0.2]
+        >>> parse_probability("1.4"), parse_probability("-0.2")
+        (1.0, 0.0)
+        >>> parse_probability("I do not know") is None
+        True
+        >>> parse_probability("") is None and parse_probability(None) is None
+        True
+    """
+    if not text:
+        return None
+    m = _FLOAT_RE.search(text)
+    if not m:
+        return None
+    try:
+        return min(1.0, max(0.0, float(m.group())))
+    except ValueError:
+        return None
+
+
 class LLMPredictor:
     """Async client wrapper: one prompt in, one :class:`SampleResult` out.
 
@@ -130,6 +165,7 @@ class LLMPredictor:
     def __init__(
         self,
         *,
+        style,
         base_url: str = "http://localhost:8000/v1",
         api_key: str = "EMPTY",
         model: str,
@@ -153,11 +189,14 @@ class LLMPredictor:
                 f"temperature 0 returns identical samples, so every probability collapses to 0 "
                 f"or 1.  Set temperature > 0 (e.g. 0.7) for repeated sampling."
             )
+        self.style = style
         self.model = model
         self.n_samples = n_samples
         self.temperature = temperature
         self.smoothing = smoothing
-        self.guided_choice = guided_choice
+        # Guided choice constrains the answer to exactly "Yes"/"No", which is meaningless (and
+        # would corrupt the answer) when the style asks for a float.
+        self.guided_choice = guided_choice and style.response_format == "yes_no"
         self.seed = seed
         self.max_retries = max_retries
         self.fallback_prob = fallback_prob
@@ -192,29 +231,39 @@ class LLMPredictor:
                 )
                 await asyncio.sleep(delay)
 
-    def _messages(self, history_text: str, question: str) -> list[dict[str, str]]:
+    def _messages(self, history_text: str, query_code: str, duration_days: float) -> list[dict[str, str]]:
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(history_text, question)},
+            {"role": "system", "content": self.style.system_prompt()},
+            {"role": "user", "content": self.style.user_prompt(history_text, query_code, duration_days)},
         ]
 
-    async def _sample(self, history_text: str, question: str) -> tuple[int, int, int]:
-        """Draw ``n_samples`` Yes/No answers; return ``(n_yes, n_no, n_unparsed)``."""
+    async def _completions(
+        self, history_text: str, query_code: str, duration_days: float
+    ) -> list[str | None]:
+        """Draw ``n_samples`` completions and return their raw text."""
+        is_float = self.style.response_format == "float"
         kwargs: dict = {
-            "messages": self._messages(history_text, question),
-            "max_tokens": _ANSWER_MAX_TOKENS,
+            "messages": self._messages(history_text, query_code, duration_days),
+            "max_tokens": _FLOAT_MAX_TOKENS if is_float else _ANSWER_MAX_TOKENS,
             "n": self.n_samples,
         }
         if self.guided_choice:
             kwargs["extra_body"] = {"guided_choice": list(YES_NO_CHOICES)}
         response = await self._create(**kwargs)
 
-        n_yes = n_no = n_unparsed = 0
+        contents: list[str | None] = []
         for choice in response.choices:
             try:
-                content = choice.message.content
+                contents.append(choice.message.content)
             except (AttributeError, IndexError):
-                content = None
+                contents.append(None)
+        return contents
+
+    @staticmethod
+    def _tally_yes_no(contents: list[str | None]) -> tuple[int, int, int]:
+        """Tally ``(n_yes, n_no, n_unparsed)`` over sampled answers."""
+        n_yes = n_no = n_unparsed = 0
+        for content in contents:
             match parse_yes_no(content):
                 case "yes":
                     n_yes += 1
@@ -225,26 +274,48 @@ class LLMPredictor:
         return n_yes, n_no, n_unparsed
 
     async def predict_prob(
-        self, history_text: str, question: str, fallback_prob: float | None = None
+        self,
+        history_text: str,
+        query_code: str,
+        duration_days: float,
+        fallback_prob: float | None = None,
     ) -> SampleResult:
-        """Extract one empirical probability for ``(history_text, question)``.
+        """Extract one occurrence probability for ``(history, query_code, duration_days)``.
 
-        Samples the model ``n_samples`` times and returns the (optionally smoothed) fraction of
-        Yes answers.  On total parse failure — no sample produced a usable Yes/No — returns
-        ``fallback_prob`` (per-row override, e.g. an externally-estimated prevalence) or the
-        instance-level default, flagged ``parse_failed=True``.
+        Under the Yes/No style, samples the model ``n_samples`` times and returns the
+        (optionally smoothed) fraction of Yes answers.  Under the float style, parses a
+        probability out of each sample and returns their mean — with ``n_samples=1`` that is
+        exactly the reference implementation's single-shot ``float(result)``, and with more
+        samples it is the same estimator with lower variance.
+
+        On total parse failure — no sample produced a usable answer — returns ``fallback_prob``
+        (per-row override, e.g. an externally-estimated prevalence) or the instance-level
+        default, flagged ``parse_failed=True``.
 
         Raises:
             openai.APIError: on transport failure after retries are exhausted — see module
                 docstring for why transport errors are never converted into fallbacks.
         """
         async with self._semaphore:
-            n_yes, n_no, n_unparsed = await self._sample(history_text, question)
+            contents = await self._completions(history_text, query_code, duration_days)
+            fb = self.fallback_prob if fallback_prob is None else fallback_prob
+
+            if self.style.response_format == "float":
+                parsed = [p for p in (parse_probability(c) for c in contents) if p is not None]
+                n_unparsed = len(contents) - len(parsed)
+                self.n_unparsed_samples += n_unparsed
+                if parsed:
+                    return SampleResult(
+                        sum(parsed) / len(parsed), 0, 0, n_unparsed, False, n_parsed=len(parsed)
+                    )
+                self.n_parse_failures += 1
+                return SampleResult(fb, 0, 0, n_unparsed, parse_failed=True, n_parsed=0)
+
+            n_yes, n_no, n_unparsed = self._tally_yes_no(contents)
             self.n_unparsed_samples += n_unparsed
             prob = empirical_probability(n_yes, n_no, self.smoothing)
             if prob is not None:
                 return SampleResult(prob, n_yes, n_no, n_unparsed, parse_failed=False)
 
             self.n_parse_failures += 1
-            fb = self.fallback_prob if fallback_prob is None else fallback_prob
             return SampleResult(fb, n_yes, n_no, n_unparsed, parse_failed=True)

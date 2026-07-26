@@ -27,6 +27,7 @@ import pytest
 
 from every_query.data.schema import TaskQuerySchema
 from every_query.evaluate.metrics import compute_metrics
+from every_query.llm_baseline.__main__ import METADATA_KEY
 from every_query.predict.schema import PredictionSchema
 
 _VENV_BIN = str(Path(sys.executable).parent)
@@ -160,8 +161,10 @@ def test_llm_predict_full_run_and_resume(tensorized_cohort_dir, llm_tasks_dir, t
     # Reproducibility metadata is on the merged parquet.
     meta = json.loads(pq.read_schema(predictions_fp).metadata[b"every_query_llm_baseline"])
     assert meta["n_samples"] == _N_SAMPLES
-    assert meta["max_events"] == 256
-    assert meta["code_descriptions_used"] is False
+    assert meta["prompt_style"] == "event_stream"
+    assert meta["response_format"] == "yes_no"
+    assert meta["style_fields"]["max_events"] == 256
+    assert meta["style_fields"]["code_descriptions_used"] is False
     assert len(meta["prompt_template_hash"]) == 16
 
     # A second run without resume refuses to mix into the same output dir (the underlying
@@ -216,3 +219,136 @@ def test_llm_predict_resume_refuses_config_mismatch(tensorized_cohort_dir, llm_t
                 llm_tasks_dir, tensorized_cohort_dir, output_dir, resume="true", model="some/other-model"
             )
         )
+
+
+# ── llm4healthcare prompt style ──────────────────────────────────────────────────────────
+
+# The testing cohort's codes are bare strings (HR, TEMP) with no MIMIC itemids, so the panel
+# is keyed by `code:` rather than `itemid:` — the same mechanism the bundled mimic_icu17 panel
+# uses, exercised over a non-MIMIC vocabulary.
+_TEST_PANEL = """\
+name: test_vitals
+features:
+  - name: Heart Rate
+    unit: "Unit: bpm."
+    range: "Reference range: 60 - 100."
+    sources:
+      - code: HR
+  - name: Temperature
+    unit: "Unit: degrees Celsius."
+    range: "Reference range: 36.1 - 37.2."
+    sources:
+      - code: TEMP
+  - name: pH
+    unit: "Unit: /."
+    range: "Reference range: 7.35 - 7.45."
+    sources:
+      - code: NOT_IN_THIS_COHORT
+"""
+
+
+class _FakeFloatCompletions:
+    """Returns an n-way completion of float answers, shaped like the openai SDK's."""
+
+    def __init__(self, answer: str = "0.7") -> None:
+        self.n_calls = 0
+        self.answer = answer
+        self.last_kwargs: dict = {}
+
+    async def create(self, **kwargs):
+        self.n_calls += 1
+        self.last_kwargs = kwargs
+        n = kwargs.get("n", 1)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.answer)) for _ in range(n)]
+        )
+
+
+@pytest.fixture
+def test_panel_fp(tmp_path: Path) -> Path:
+    fp = tmp_path / "test_vitals.yaml"
+    fp.write_text(_TEST_PANEL)
+    return fp
+
+
+def test_llm4healthcare_style_end_to_end(
+    llm_tasks_dir: Path, tensorized_cohort_dir: Path, tmp_path: Path, test_panel_fp: Path
+):
+    """The panel style runs the same pipeline and produces EQ_evaluate-consumable output."""
+    output_dir = tmp_path / "out"
+    completions = _FakeFloatCompletions("0.7")
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    argv = _overrides(
+        llm_tasks_dir,
+        tensorized_cohort_dir,
+        output_dir,
+        prompt_style="llm4healthcare",
+        **{"l4h.panel": str(test_panel_fp)},
+    )
+    with (
+        patch("every_query.llm_baseline.llm_predict.AsyncOpenAI", return_value=fake_client),
+        patch.object(sys, "argv", ["EQ_llm_predict", *argv]),
+    ):
+        from every_query.llm_baseline.__main__ import main
+
+        main()
+
+    predictions = pl.read_parquet(output_dir / "predictions.parquet")
+    assert predictions.height == 4
+    assert predictions["occurs_prob"].to_list() == pytest.approx([0.7] * 4)
+    # Still PredictionSchema-conformant and consumable by the metrics pipeline unchanged.
+    PredictionSchema.align(predictions.to_arrow())
+    assert compute_metrics(predictions).height > 0
+
+    # Float mode records n_parsed and leaves the Yes/No counters at zero.
+    details = pl.read_parquet(output_dir / "details.parquet")
+    assert details["parse_failed"].sum() == 0
+    assert set(details["n_parsed"].to_list()) == {_N_SAMPLES}
+    assert set(details["n_yes"].to_list()) == {0}
+
+    # guided_choice must not be sent in float mode even though the config leaves it true.
+    assert "extra_body" not in completions.last_kwargs
+
+    # The rendered prompt is the reference template over the panel's fixed feature axis.
+    user_turn = completions.last_kwargs["messages"][1]["content"]
+    assert user_turn.startswith("I will provide you with medical information from multiple")
+    assert "- Heart Rate: Unit: bpm. Reference range: 60 - 100." in user_turn
+    assert "Please respond with only a floating-point number between 0 and 1" in user_turn
+    assert user_turn.rstrip().endswith("RESPONSE:")
+    # Every panel feature gets a row, including the one absent from this cohort.
+    for feature in ("Heart Rate", "Temperature", "pH"):
+        assert f'- {feature}: "' in user_turn
+
+    # Metadata records the style and its knobs, so a resume cannot mix styles.
+    meta = json.loads(pq.read_schema(output_dir / "predictions.parquet").metadata[METADATA_KEY])
+    assert meta["prompt_style"] == "llm4healthcare"
+    assert meta["response_format"] == "float"
+    assert meta["style_fields"]["panel"] == "test_vitals"
+    assert meta["style_fields"]["form"] == "string"
+
+
+def test_resume_refuses_to_mix_prompt_styles(
+    llm_tasks_dir: Path, tensorized_cohort_dir: Path, tmp_path: Path, test_panel_fp: Path
+):
+    """Shards written under one prompt style may never be extended under another."""
+    output_dir = tmp_path / "out"
+    _run_main_with_fake_client(_overrides(llm_tasks_dir, tensorized_cohort_dir, output_dir))
+
+    completions = _FakeFloatCompletions("0.7")
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    argv = _overrides(
+        llm_tasks_dir,
+        tensorized_cohort_dir,
+        output_dir,
+        resume="true",
+        prompt_style="llm4healthcare",
+        **{"l4h.panel": str(test_panel_fp)},
+    )
+    with (
+        patch("every_query.llm_baseline.llm_predict.AsyncOpenAI", return_value=fake_client),
+        patch.object(sys, "argv", ["EQ_llm_predict", *argv]),
+        pytest.raises(SystemExit),  # hydra converts the ValueError to SystemExit(1)
+    ):
+        from every_query.llm_baseline.__main__ import main
+
+        main()
