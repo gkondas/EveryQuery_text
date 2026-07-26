@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eq-llm-dryrun
-#SBATCH --partition=cpu
+#SBATCH --partition=FILL-IN
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
