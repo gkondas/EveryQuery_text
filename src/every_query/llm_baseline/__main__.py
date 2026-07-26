@@ -347,11 +347,21 @@ def _print_dry_run_prompts(
     identifiers: pl.DataFrame,
     pending: list[int],
     n_prompts: int = 3,
+    n_stats_groups: int = 200,
 ) -> None:
-    """Print fully serialized prompts for the first few distinct histories, then return."""
+    """Print prompts for the first few distinct histories; serialize more to sample the stats.
+
+    Printing stops at ``n_prompts``, but serialization continues to ``n_stats_groups`` so the
+    caller's truncation / empty-record rates are measured over a sample rather than over the
+    three histories that happened to print.  A single empty window says nothing about whether
+    the panel matches the cohort; 200 of them do.  Bounded rather than sweeping all of
+    ``pending`` so a dry run over a multi-million-row cohort still returns in seconds.
+    """
     seen_groups: set[tuple[int, datetime]] = set()
     shown = 0
     for row_idx in pending:
+        if len(seen_groups) >= n_stats_groups:
+            break
         subject_id = identifiers[TaskQuerySchema.subject_id_name][row_idx]
         prediction_time = identifiers[TaskQuerySchema.prediction_time_name][row_idx]
         if (subject_id, prediction_time) in seen_groups:
@@ -359,6 +369,8 @@ def _print_dry_run_prompts(
         seen_groups.add((subject_id, prediction_time))
 
         history = serializer.history_for_row(row_idx)
+        if shown >= n_prompts:
+            continue
         query_code = identifiers[TaskQuerySchema.query_name][row_idx]
         duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
         print(
@@ -368,9 +380,11 @@ def _print_dry_run_prompts(
         print(f"[system]\n{style.system_prompt()}\n")
         print(f"[user]\n{style.user_prompt(history.text, query_code, duration)}")
         shown += 1
-        if shown >= n_prompts:
-            break
-    print(f"\n{'=' * 80}\nDry run: {shown} prompt(s) shown; no requests were sent.")
+    print(
+        f"\n{'=' * 80}\nDry run: {shown} prompt(s) shown over {serializer.n_serialized} "
+        f"serialized histories; no requests were sent."
+    )
+    serializer.log_truncation_stats()
 
 
 def _group_pending_rows(identifiers: pl.DataFrame, pending: list[int]) -> list[list[int]]:
