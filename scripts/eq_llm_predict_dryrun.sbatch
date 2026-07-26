@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eq-llm-dryrun
-#SBATCH --partition=FILL-IN
+#SBATCH --partition=cpu
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
@@ -35,7 +35,7 @@ export REPO_DIR="$HOME/EveryQuery_text"
 # Inputs. TENSORIZED_COHORT_DIR is the EQ_process_data `final/` output; TASKS_DIR holds
 # TaskQuerySchema parquets for the split named below. Both must be readable from the
 # COMPUTE node — a path that only exists on the login node is exactly what this catches.
-export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks/eval/held_out"
+export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out"
 export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
 export SPLIT="held_out"
 

@@ -27,7 +27,7 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Keep these identical to eq_llm_predict_dryrun.sbatch — the dry run is only
 # evidence for the real run if both read the same cohort.
-export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks/eval/held_out"
+export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out"
 export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
 export SPLIT="held_out"
 
