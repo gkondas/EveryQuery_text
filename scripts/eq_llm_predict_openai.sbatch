@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eq-llm-openai
-#SBATCH --partition=<FILL>
-#SBATCH --account=<FILL>
+#SBATCH --partition=cpu
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
@@ -26,30 +25,49 @@ set -euo pipefail
 # Repo checkout. The job may start in any directory, so we cd here explicitly.
 export REPO_DIR="$HOME/EveryQuery_text"
 
-# Inputs. TENSORIZED_COHORT_DIR is the EQ_process_data `final/` output; TASKS_DIR holds
-# TaskQuerySchema parquets for the split named below.
-export TASKS_DIR="$HOME/data/MIMIC_MEDS_DEMO/eq_tasks/eval/held_out"
-export TENSORIZED_COHORT_DIR="$HOME/data/MIMIC_MEDS_DEMO/eq_processed/final"
+# Inputs. Keep these identical to eq_llm_predict_dryrun.sbatch — the dry run is only
+# evidence for the real run if both read the same cohort.
+export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks/eval/held_out"
+export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
 export SPLIT="held_out"
 
 # Output. Use a NEW directory per configuration — resume refuses to extend shards written
 # under a different model/prompt/sampling config (the run_fingerprint check).
-export OUTPUT_DIR="$HOME/data/MIMIC_MEDS_DEMO/llm_baseline_out_gpt"
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt"
 
-# Model. MUST support n>1 on chat completions — the whole method is a 20-way sampled
-# Yes/No vote in a single request. Reasoning/o-series models do not qualify.
-export MODEL="<chat-model-with-n-support>"
+# Model. Must honor `max_tokens` and `temperature` on chat completions — reasoning models
+# (o-series, gpt-5) reject the first and ignore the second, and their answer would be
+# reasoning rather than a bare float. Raising N_SAMPLES above 1 additionally requires `n`.
+export MODEL="gpt-4.1"
 
-# Serialization. max_events counts unique timestamps, NOT code lines — one ICU timestamp
-# can expand to 60+ codes, so prompt length scales with codes-per-event. Set
-# CODE_DESCRIPTIONS to "" for the raw-code ablation arm.
+# Which serialization to send. Match what you verified in the dry run.
+export PROMPT_STYLE="llm4healthcare"
+
+# --- event_stream knobs (ignored under llm4healthcare) ---
 export MAX_EVENTS=50
 export CODE_DESCRIPTIONS="${TENSORIZED_COHORT_DIR}/metadata/codes.parquet"
 
-# Sampling vote. TEMPERATURE must be > 0 (at 0 every sample is identical and the
-# probability collapses to 0 or 1; the code raises on this).
-export N_SAMPLES=20
-export TEMPERATURE=0.7
+# --- llm4healthcare knobs (ignored under event_stream) ---
+export L4H_PANEL="mimic_icu17"
+export L4H_FORM="string"
+export L4H_IMPUTE="locf"
+export L4H_MAX_VISITS=48
+export L4H_RECORD_TIME_MODE="days_before"
+# float = the reference paper's format (average a parsed probability over the samples);
+# yes_no = the better-calibrated vote, but no longer their prompt.
+export L4H_RESPONSE_FORMAT="float"
+
+# Answer extraction — the reference paper's single-shot setup: one completion, one parsed
+# float, greedy. TEMPERATURE=0 is only legal because N_SAMPLES=1; the code raises on
+# n_samples>1 at temperature 0 (identical samples collapse every probability to 0 or 1),
+# so raise TEMPERATURE alongside N_SAMPLES if you ever sample more.
+export N_SAMPLES=1
+export TEMPERATURE=0
+# Their constant for the "I do not know" escape hatch — not a number, so it lands here as
+# a parse failure. Not derived from this split's labels.
+export FALLBACK_PROB=0.501
+# No-op in float mode (the Laplace prior only touches the Yes/No vote); kept for the
+# yes_no arm.
 export SMOOTHING=0.0
 
 # Throughput. Tune MAX_CONCURRENCY to your OpenAI rate-limit tier: exhausting the retry
@@ -64,8 +82,9 @@ export MAX_RETRIES=8
 export BATCH_SIZE=25
 
 # Smoke test: set to a row count for a short verification run, or "" for the full pass.
-# Start with 20 to confirm n>1 works and that parsing survives guided_choice=false.
-export LIMIT="20"
+# Start with 20 to confirm the float parser survives real completions (check parse_failed
+# in details.parquet before committing to the full pass).
+export LIMIT="10"
 
 # API key. Kept OUT of this file on purpose — scripts/ is tracked by git and a literal key
 # here is one `git push` from a leak. Store it mode-600 instead:
@@ -103,10 +122,19 @@ if [[ "$http_code" == "000" ]]; then
 fi
 echo "egress ok (api.openai.com -> $http_code)"
 
-# Optional args assembled conditionally so unset ones fall back to the config defaults.
+# Optional args assembled conditionally so unset ones fall back to the config defaults,
+# and so the unused style's knobs never reach the config.
 extra_args=()
 [[ -n "$LIMIT" ]] && extra_args+=("limit=$LIMIT")
-[[ -n "$CODE_DESCRIPTIONS" ]] && extra_args+=("code_descriptions=$CODE_DESCRIPTIONS")
+if [[ "$PROMPT_STYLE" == "llm4healthcare" ]]; then
+    extra_args+=("l4h.panel=$L4H_PANEL" "l4h.form=$L4H_FORM" "l4h.impute=$L4H_IMPUTE")
+    extra_args+=("l4h.max_visits=$L4H_MAX_VISITS")
+    extra_args+=("l4h.record_time_mode=$L4H_RECORD_TIME_MODE")
+    extra_args+=("l4h.response_format=$L4H_RESPONSE_FORMAT")
+else
+    extra_args+=("max_events=$MAX_EVENTS")
+    [[ -n "$CODE_DESCRIPTIONS" ]] && extra_args+=("code_descriptions=$CODE_DESCRIPTIONS")
+fi
 
 # No srun and no job array, matching the single-node/single-task convention in
 # generate_tasks/redesign-spec.md. Do NOT run array tasks against one OUTPUT_DIR: there is
@@ -120,7 +148,7 @@ uv run EQ_llm_predict \
     tensorized_cohort_dir="$TENSORIZED_COHORT_DIR" \
     output_dir="$OUTPUT_DIR" \
     split="$SPLIT" \
-    max_events="$MAX_EVENTS" \
+    prompt_style="$PROMPT_STYLE" \
     base_url=https://api.openai.com/v1 \
     api_key="$OPENAI_API_KEY" \
     model="$MODEL" \
@@ -128,6 +156,7 @@ uv run EQ_llm_predict \
     n_samples="$N_SAMPLES" \
     temperature="$TEMPERATURE" \
     smoothing="$SMOOTHING" \
+    fallback_prob="$FALLBACK_PROB" \
     max_concurrency="$MAX_CONCURRENCY" \
     max_retries="$MAX_RETRIES" \
     batch_size="$BATCH_SIZE" \
