@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eq-llm-openai
-#SBATCH --partition=FILL-IN
+#SBATCH --partition=cpu
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=08:00:00
@@ -84,7 +84,7 @@ export BATCH_SIZE=25
 # Smoke test: set to a row count for a short verification run, or "" for the full pass.
 # Start with 20 to confirm the float parser survives real completions (check parse_failed
 # in details.parquet before committing to the full pass).
-export LIMIT="10"
+export LIMIT="20"
 
 # API key. Kept OUT of this file on purpose — scripts/ is tracked by git and a literal key
 # here is one `git push` from a leak. Store it mode-600 instead:
