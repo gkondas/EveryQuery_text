@@ -18,9 +18,14 @@
 #   - histories serialize under the chosen prompt style (panel resolves, values decode)
 #   - what the model will actually be sent, verbatim
 #
-# What it does NOT prove: only the first 3 distinct histories are rendered (the dry-run
-# printer is fixed at 3), so this is not a whole-cohort serialization sweep. It also
-# writes nothing — dry_run returns before the output directory is touched, so OUTPUT_DIR
+#   - exactly how many API requests the real run will send, and their total prompt size
+#
+# Only 3 prompts are PRINTED, but dry_run_max_groups=null below serializes every history and
+# sizes every request, so the reported character total is exact rather than extrapolated.
+# That is a full pass over the cohort's windows — if it outgrows the 30-minute --time above,
+# either raise it or drop dry_run_max_groups to sample (200 is the default).
+#
+# It writes nothing — dry_run returns before the output directory is touched, so OUTPUT_DIR
 # below is a placeholder the config requires rather than a path that gets created.
 #
 # Sibling script for the real run: scripts/eq_llm_predict_openai.sbatch
@@ -91,6 +96,7 @@ uv run EQ_llm_predict \
     split="$SPLIT" \
     prompt_style="$PROMPT_STYLE" \
     dry_run=true \
+    dry_run_max_groups=null \
     "${extra_args[@]}"
 
 echo "finished=$(date -Is)"

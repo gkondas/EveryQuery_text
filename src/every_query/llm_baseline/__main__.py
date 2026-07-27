@@ -58,6 +58,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -347,44 +348,75 @@ def _print_dry_run_prompts(
     identifiers: pl.DataFrame,
     pending: list[int],
     n_prompts: int = 3,
-    n_stats_groups: int = 200,
+    max_groups: int | None = 200,
+    n_samples: int = 1,
 ) -> None:
-    """Print prompts for the first few distinct histories; serialize more to sample the stats.
+    """Print a few prompts, and size every prompt the real run would send.
 
-    Printing stops at ``n_prompts``, but serialization continues to ``n_stats_groups`` so the
-    caller's truncation / empty-record rates are measured over a sample rather than over the
-    three histories that happened to print.  A single empty window says nothing about whether
-    the panel matches the cohort; 200 of them do.  Bounded rather than sweeping all of
-    ``pending`` so a dry run over a multi-million-row cohort still returns in seconds.
+    Printing stops at ``n_prompts``, but sizing continues to ``max_groups`` distinct histories so
+    the truncation / empty-record rates and the prompt-length distribution are measured over a
+    sample rather than over the three histories that happened to print.  A single empty window
+    says nothing about whether the panel matches the cohort; 200 of them do.
+
+    ``max_groups=None`` sweeps all of ``pending`` instead — every history serialized, every
+    prompt measured, so the reported character total is exactly what the real run will send
+    rather than an extrapolation.  That costs one full pass over the cohort's windows, which is
+    why the bounded sample is the default.
+
+    Groups are walked through :func:`_group_pending_rows` — the same grouping the real run's
+    producer uses — so each history is serialized once and then charged once per row sharing it,
+    matching request-for-request what ``_run_async`` would enqueue.
     """
-    seen_groups: set[tuple[int, datetime]] = set()
-    shown = 0
-    for row_idx in pending:
-        if len(seen_groups) >= n_stats_groups:
-            break
-        subject_id = identifiers[TaskQuerySchema.subject_id_name][row_idx]
-        prediction_time = identifiers[TaskQuerySchema.prediction_time_name][row_idx]
-        if (subject_id, prediction_time) in seen_groups:
-            continue
-        seen_groups.add((subject_id, prediction_time))
+    groups = _group_pending_rows(identifiers, pending)
+    swept = groups if max_groups is None else groups[:max_groups]
+    queries = identifiers[TaskQuerySchema.query_name]
+    durations = identifiers[TaskQuerySchema.duration_days_name]
+    system_chars = len(style.system_prompt())
 
-        history = serializer.history_for_row(row_idx)
-        if shown >= n_prompts:
-            continue
-        query_code = identifiers[TaskQuerySchema.query_name][row_idx]
-        duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
-        print(
-            f"\n{'=' * 80}\n--- prompt {shown + 1} (subject={subject_id}, "
-            f"prediction_time={prediction_time}, style={style.name}) ---"
-        )
-        print(f"[system]\n{style.system_prompt()}\n")
-        print(f"[user]\n{style.user_prompt(history.text, query_code, duration)}")
-        shown += 1
+    prompt_chars: list[int] = []
+    shown = 0
+    for row_idxs in swept:
+        history = serializer.history_for_row(row_idxs[0])
+        # One prompt per row, not per group: rows sharing a history still differ in query code
+        # and horizon, and each is a separate request.
+        for row_idx in row_idxs:
+            user = style.user_prompt(history.text, queries[row_idx], float(durations[row_idx]))
+            prompt_chars.append(system_chars + len(user))
+            if shown < n_prompts:
+                print(
+                    f"\n{'=' * 80}\n--- prompt {shown + 1} "
+                    f"(subject={identifiers[TaskQuerySchema.subject_id_name][row_idx]}, "
+                    f"prediction_time={identifiers[TaskQuerySchema.prediction_time_name][row_idx]}, "
+                    f"style={style.name}) ---"
+                )
+                print(f"[system]\n{style.system_prompt()}\n")
+                print(f"[user]\n{user}")
+                shown += 1
+
     print(
         f"\n{'=' * 80}\nDry run: {shown} prompt(s) shown over {serializer.n_serialized} "
         f"serialized histories; no requests were sent."
     )
     serializer.log_truncation_stats()
+    if not prompt_chars:
+        return
+
+    total = sum(prompt_chars)
+    scope = "all pending rows" if max_groups is None else f"a {len(swept)}-history sample"
+    logger.info(
+        f"Prompt size over {scope}: {len(prompt_chars)} requests, "
+        f"min/median/max {min(prompt_chars)}/{int(statistics.median(prompt_chars))}/"
+        f"{max(prompt_chars)} chars, {total} chars total"
+    )
+    # ponytail: chars/4 is the usual English-text rule of thumb, not a tokenizer.  Numeric
+    # panels tokenize worse than prose, so treat this as a floor; pip install tiktoken and
+    # count for real if the estimate lands near a budget you cannot overshoot.
+    logger.info(
+        f"Rough input-token estimate (chars/4): {total // 4:,} prompt tokens"
+        + ("" if max_groups is not None else f" + {len(prompt_chars) * n_samples} sampled completions")
+    )
+    if max_groups is not None:
+        logger.info("Set dry_run_max_groups=null to sweep every history for an exact total.")
 
 
 def _group_pending_rows(identifiers: pl.DataFrame, pending: list[int]) -> list[list[int]]:
@@ -505,6 +537,12 @@ def main(cfg: DictConfig) -> None:
             f"{len(pending)} rows pending over {n_groups} unique (subject, prediction_time) "
             f"histories ({len(pending) / n_groups:.1f} queries per serialized history)"
         )
+        # One request per pending row — n_samples rides along as `n=` on that one request
+        # (see LLMPredictor._completions), so it costs completion tokens, not extra calls.
+        logger.info(
+            f"A real run sends {len(pending)} API requests "
+            f"({len(pending)} x n_samples={cfg.n_samples} = {len(pending) * int(cfg.n_samples)} sampled completions)"
+        )
     else:
         logger.info("0 rows pending — nothing to do")
 
@@ -512,7 +550,12 @@ def main(cfg: DictConfig) -> None:
     serializer = _HistorySerializer(dataset=dataset, style=style)
 
     if cfg.dry_run:
-        _print_dry_run_prompts(serializer, style, identifiers, pending)
+        max_groups = None if cfg.dry_run_max_groups is None else int(cfg.dry_run_max_groups)
+        if max_groups is None:
+            logger.info(f"dry_run_max_groups=null: serializing all {n_groups} histories — this is a full pass")
+        _print_dry_run_prompts(
+            serializer, style, identifiers, pending, max_groups=max_groups, n_samples=int(cfg.n_samples)
+        )
         return
 
     payload = _run_payload(cfg, style)

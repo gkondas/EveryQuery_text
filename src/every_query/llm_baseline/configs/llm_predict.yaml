@@ -155,6 +155,10 @@ limit: null
 resume: false
 # Print ~3 fully serialized prompts and exit without contacting the server.
 dry_run: false
+# Under dry_run, how many distinct histories to serialize for the stats/size report.  null
+# sweeps every pending row — an exact prompt-character total instead of a sample, at the cost
+# of one full pass over the cohort's windows.
+dry_run_max_groups: 200
 
 hydra:
   output_subdir: null

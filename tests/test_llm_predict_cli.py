@@ -129,6 +129,28 @@ def test_llm_predict_dry_run_subprocess(tensorized_cohort_dir, llm_tasks_dir, tm
     assert not (output_dir / "shards").exists() or not list((output_dir / "shards").glob("*.parquet"))
 
 
+def test_llm_predict_dry_run_full_sweep_sizes_every_request(
+    tensorized_cohort_dir, llm_tasks_dir, tmp_path
+):
+    """dry_run_max_groups=null sizes one prompt per pending row — the real run's request count."""
+    result = subprocess.run(
+        [
+            "EQ_llm_predict",
+            *_overrides(llm_tasks_dir, tensorized_cohort_dir, tmp_path / "out", dry_run="true"),
+            "dry_run_max_groups=null",
+        ],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{_VENV_BIN}:/usr/bin:/bin"},
+        timeout=300,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    log = result.stdout + result.stderr
+    n_rows = len(_SUBJECT_PRED_TIMES) * len(_QUERY_CODES)
+    assert f"A real run sends {n_rows} API requests" in log
+    assert f"over all pending rows: {n_rows} requests" in log
+
+
 def test_llm_predict_full_run_and_resume(tensorized_cohort_dir, llm_tasks_dir, tmp_path):
     """Full mocked-server run: PredictionSchema output, EQ_evaluate consumption, resume."""
     output_dir = tmp_path / "out"
