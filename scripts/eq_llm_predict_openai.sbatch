@@ -3,7 +3,7 @@
 #SBATCH --partition=cpu
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/eq_llm_%j.out
 #SBATCH --requeue
 #
@@ -27,13 +27,17 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Keep these identical to eq_llm_predict_dryrun.sbatch — the dry run is only
 # evidence for the real run if both read the same cohort.
-export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out"
+export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_id/eval/held_out"
 export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
 export SPLIT="held_out"
 
 # Output. Use a NEW directory per configuration — resume refuses to extend shards written
 # under a different model/prompt/sampling config (the run_fingerprint check).
-export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt"
+#
+# Also new per TASKS_DIR, which the fingerprint does NOT cover: the ID-filtered subsample is
+# an independent draw, so resuming into llm_baseline_out_gpt_alltasks would union two
+# different patient populations under the same task.
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_id"
 
 # Model. Must honor `max_tokens` and `temperature` on chat completions — reasoning models
 # (o-series, gpt-5) reject the first and ignore the second, and their answer would be
