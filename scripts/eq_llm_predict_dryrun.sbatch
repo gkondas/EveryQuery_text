@@ -69,6 +69,12 @@ export L4H_MAX_VISITS=48
 # MEDS window has and their resampled ICU panels do not.
 export L4H_RECORD_TIME_MODE="days_before"   # index | days_before
 
+# Completions per row. Does not change a single prompt — it only scales the "sampled
+# completions" line in the sizing report — but the config default is 20 (the event_stream
+# vote), so leaving it unset makes this dry run overstate the single-shot l4h arm 20x.
+# Keep it equal to N_SAMPLES in the real script you are sizing.
+export N_SAMPLES=1
+
 # ─── END EDIT ME ────────────────────────────────────────────────────────────────────────
 
 cd "$REPO_DIR"
@@ -95,6 +101,7 @@ uv run EQ_llm_predict \
     output_dir="$OUTPUT_DIR" \
     split="$SPLIT" \
     prompt_style="$PROMPT_STYLE" \
+    n_samples="$N_SAMPLES" \
     dry_run=true \
     dry_run_max_groups=null \
     "${extra_args[@]}"
