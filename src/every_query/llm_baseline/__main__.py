@@ -119,6 +119,7 @@ _FINGERPRINT_FIELDS = (
     "guided_choice",
     "seed",
     "fallback_prob",
+    "skip_empty_histories",
     "extra_body",
 )
 
@@ -139,6 +140,7 @@ def _run_payload(cfg: DictConfig, style: PromptStyle) -> dict:
         "guided_choice": bool(cfg.guided_choice),
         "seed": int(cfg.seed),
         "fallback_prob": None if cfg.fallback_prob is None else float(cfg.fallback_prob),
+        "skip_empty_histories": bool(cfg.skip_empty_histories),
         "extra_body": None if cfg.extra_body is None else OmegaConf.to_container(cfg.extra_body),
     }
     fingerprint_subset = {k: payload[k] for k in _FINGERPRINT_FIELDS}
@@ -233,7 +235,7 @@ class _ShardedWriter:
     Each flush writes one parquet per directory via a ``.tmp`` sibling + atomic rename, so a crash mid-write
     never leaves a half-written ``.parquet`` to corrupt a later ``resume`` scan.  Prediction shards are
     ``PredictionSchema.align``-ed and carry the run-metadata blob; the sidecar carries the same identifier
-    columns plus ``occurs_prob``, ``parse_failed``, and the Yes/No/unparsed vote counts.
+    columns plus ``occurs_prob``, ``parse_failed``, ``skipped``, and the Yes/No/unparsed vote counts.
     """
 
     def __init__(
@@ -291,6 +293,8 @@ class _ShardedWriter:
                     "n_no": [res.n_no for _, res in results],
                     "n_unparsed": [res.n_unparsed for _, res in results],
                     "n_parsed": [res.n_parsed for _, res in results],
+                    # never sent to the model — a constant fallback, not a prediction
+                    "skipped": [res.skipped for _, res in results],
                 }
             )
         )
@@ -350,6 +354,7 @@ def _print_dry_run_prompts(
     n_prompts: int = 3,
     max_groups: int | None = 200,
     n_samples: int = 1,
+    skip_empty: bool = False,
 ) -> None:
     """Print a few prompts, and size every prompt the real run would send.
 
@@ -365,7 +370,8 @@ def _print_dry_run_prompts(
 
     Groups are walked through :func:`_group_pending_rows` — the same grouping the real run's
     producer uses — so each history is serialized once and then charged once per row sharing it,
-    matching request-for-request what ``_run_async`` would enqueue.
+    matching request-for-request what ``_run_async`` would enqueue.  ``skip_empty`` mirrors
+    ``skip_empty_histories``: rows the real run would never send are charged nothing here.
     """
     groups = _group_pending_rows(identifiers, pending)
     swept = groups if max_groups is None else groups[:max_groups]
@@ -375,8 +381,13 @@ def _print_dry_run_prompts(
 
     prompt_chars: list[int] = []
     shown = 0
+    n_skipped = 0
     for row_idxs in swept:
         history = serializer.history_for_row(row_idxs[0])
+        if skip_empty and history.n_events_total == 0:
+            # costs nothing in a real run, so it must cost nothing in the estimate either
+            n_skipped += len(row_idxs)
+            continue
         # One prompt per row, not per group: rows sharing a history still differ in query code
         # and horizon, and each is a separate request.
         for row_idx in row_idxs:
@@ -398,6 +409,11 @@ def _print_dry_run_prompts(
         f"serialized histories; no requests were sent."
     )
     serializer.log_truncation_stats()
+    if n_skipped:
+        logger.info(
+            f"skip_empty_histories=true: {n_skipped} rows would take fallback_prob without a "
+            f"request and are excluded from the sizing below."
+        )
     if not prompt_chars:
         return
 
@@ -446,23 +462,34 @@ async def _run_async(
     """
     n_workers = int(cfg.max_concurrency)
     shard_size = int(cfg.batch_size)
-    queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue(maxsize=max(2 * n_workers, 32))
+    skip_empty = bool(cfg.skip_empty_histories)
+    # `(row_idx, None)` marks a row whose history is empty: the worker writes the fallback
+    # probability for it instead of sending a request.  Distinct from the bare `None` that
+    # shuts a worker down.
+    queue: asyncio.Queue[tuple[int, str | None] | None] = asyncio.Queue(maxsize=max(2 * n_workers, 32))
     buffer: list[tuple[int, SampleResult]] = []
+    n_skipped = 0
 
     async def producer() -> None:
+        nonlocal n_skipped
         for row_idxs in _group_pending_rows(identifiers, pending):
             history = serializer.history_for_row(row_idxs[0])
+            text = None if (skip_empty and history.n_events_total == 0) else history.text
+            n_skipped += len(row_idxs) if text is None else 0
             for row_idx in row_idxs:
-                await queue.put((row_idx, history.text))
+                await queue.put((row_idx, text))
         for _ in range(n_workers):
             await queue.put(None)
 
     async def worker() -> None:
         while (item := await queue.get()) is not None:
             row_idx, history_text = item
-            query = identifiers[TaskQuerySchema.query_name][row_idx]
-            duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
-            result = await predictor.predict_prob(history_text, query, duration)
+            if history_text is None:
+                result = SampleResult(predictor.fallback_prob, 0, 0, 0, parse_failed=False, skipped=True)
+            else:
+                query = identifiers[TaskQuerySchema.query_name][row_idx]
+                duration = float(identifiers[TaskQuerySchema.duration_days_name][row_idx])
+                result = await predictor.predict_prob(history_text, query, duration)
             buffer.append((row_idx, result))
             if len(buffer) >= shard_size:
                 writer.flush(buffer)
@@ -481,6 +508,13 @@ async def _run_async(
         raise
     writer.flush(buffer)
     serializer.log_truncation_stats()
+    if n_skipped:
+        logger.warning(
+            f"skip_empty_histories=true: {n_skipped} of {len(pending)} rows "
+            f"({n_skipped / len(pending):.1%}) got fallback_prob={predictor.fallback_prob} without an "
+            f"API request. They carry a constant probability — exclude them via the details "
+            f"sidecar's `skipped` column before reading anything into their AUROC."
+        )
 
 
 @hydra.main(version_base="1.3", config_path=CONFIGS, config_name="llm_predict")
@@ -554,7 +588,13 @@ def main(cfg: DictConfig) -> None:
         if max_groups is None:
             logger.info(f"dry_run_max_groups=null: serializing all {n_groups} histories — this is a full pass")
         _print_dry_run_prompts(
-            serializer, style, identifiers, pending, max_groups=max_groups, n_samples=int(cfg.n_samples)
+            serializer,
+            style,
+            identifiers,
+            pending,
+            max_groups=max_groups,
+            n_samples=int(cfg.n_samples),
+            skip_empty=bool(cfg.skip_empty_histories),
         )
         return
 

@@ -349,6 +349,70 @@ def test_llm4healthcare_style_end_to_end(
     assert meta["style_fields"]["form"] == "string"
 
 
+_EMPTY_PANEL = """\
+name: absent_vitals
+features:
+  - name: Heart Rate
+    unit: "Unit: bpm."
+    range: "Reference range: 60 - 100."
+    sources:
+      - code: NOT_IN_THIS_COHORT
+"""
+
+
+def test_skip_empty_histories_writes_fallback_without_requests(
+    llm_tasks_dir: Path, tensorized_cohort_dir: Path, tmp_path: Path
+):
+    """Rows whose history holds no panel measurement take fallback_prob and cost no request."""
+    panel_fp = tmp_path / "absent.yaml"
+    panel_fp.write_text(_EMPTY_PANEL)  # matches nothing, so every history serializes empty
+
+    def run(output_dir: Path, skip: str) -> tuple[_FakeFloatCompletions, pl.DataFrame, pl.DataFrame]:
+        completions = _FakeFloatCompletions("0.7")
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        argv = _overrides(
+            llm_tasks_dir,
+            tensorized_cohort_dir,
+            output_dir,
+            prompt_style="llm4healthcare",
+            fallback_prob=0.501,
+            skip_empty_histories=skip,
+            **{"l4h.panel": str(panel_fp)},
+        )
+        with (
+            patch("every_query.llm_baseline.llm_predict.AsyncOpenAI", return_value=fake_client),
+            patch.object(sys, "argv", ["EQ_llm_predict", *argv]),
+        ):
+            from every_query.llm_baseline.__main__ import main
+
+            main()
+        return (
+            completions,
+            pl.read_parquet(output_dir / "predictions.parquet"),
+            pl.read_parquet(output_dir / "details.parquet"),
+        )
+
+    completions, predictions, details = run(tmp_path / "skipped", "true")
+    assert completions.n_calls == 0, "an empty history still hit the API"
+    # every row is still WRITTEN — otherwise resume would retry them forever
+    assert predictions.height == 4
+    assert predictions["occurs_prob"].to_list() == pytest.approx([0.501] * 4)
+    PredictionSchema.align(predictions.to_arrow())
+    # distinguishable from a real parse failure, so they can be dropped before scoring
+    assert details["skipped"].all()
+    assert details["parse_failed"].sum() == 0
+
+    # Control: the same empty panel still costs one request per row when the flag is off,
+    # so it is the flag doing this and not the panel.
+    control, _, control_details = run(tmp_path / "asked", "false")
+    assert control.n_calls == 4
+    assert not control_details["skipped"].any()
+
+    # Fingerprinted, so resume cannot silently mix skipped rows into an asked-anyway run.
+    meta = json.loads(pq.read_schema(tmp_path / "skipped" / "predictions.parquet").metadata[METADATA_KEY])
+    assert meta["skip_empty_histories"] is True
+
+
 def test_resume_refuses_to_mix_prompt_styles(
     llm_tasks_dir: Path, tensorized_cohort_dir: Path, tmp_path: Path, test_panel_fp: Path
 ):

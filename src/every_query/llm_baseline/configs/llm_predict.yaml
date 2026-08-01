@@ -58,6 +58,16 @@ smoothing: 0.0
 # from the evaluated split's own labels, which would leak ground truth into predictions.
 # Failures are always flagged in the details sidecar's parse_failed column — never coerced.
 fallback_prob: null
+# Write `fallback_prob` directly for rows whose history serialized to nothing, instead of
+# sending a request.  Under the panel styles an empty history renders to demographics alone
+# ("no measurements of these features were recorded"), so the model is answering from age and
+# sex — on the MIMIC eval grid that is ~77% of histories and the bulk of the API bill.
+#
+# This is a scientific choice, not just a cost knob, and it is fingerprinted: skipped rows
+# carry a constant probability that contributes only ties to AUROC, and they are flagged
+# `skipped` in the details sidecar so they can be excluded downstream.  false reproduces the
+# reference setup, which asks the model anyway.
+skip_empty_histories: false
 # Extra JSON fields merged into every request body (vLLM/OpenAI extensions).  Needed for
 # thinking-style models whose answer would otherwise be reasoning rather than Yes/No,
 # e.g. Qwen3.5:  extra_body='{chat_template_kwargs: {enable_thinking: false}}'

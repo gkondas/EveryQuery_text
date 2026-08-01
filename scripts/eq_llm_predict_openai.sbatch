@@ -74,6 +74,13 @@ export FALLBACK_PROB=0.501
 # yes_no arm.
 export SMOOTHING=0.0
 
+# ~77% of histories on this eval grid hold no mimic_icu17 measurement at all, so their prompt
+# is age + sex + "no measurements were recorded". true writes FALLBACK_PROB for those rows
+# without sending a request — most of the API bill, none of the signal. They are flagged
+# `skipped` in details.parquet; drop them before reading their AUROC, since a constant
+# probability contributes only ties. false = ask the model anyway (the reference setup).
+export SKIP_EMPTY_HISTORIES=true
+
 # Throughput. Tune MAX_CONCURRENCY to your OpenAI rate-limit tier: exhausting the retry
 # budget on 429s aborts the run by design (transport failures are never silently written
 # as fallback probabilities).
@@ -161,6 +168,7 @@ uv run EQ_llm_predict \
     temperature="$TEMPERATURE" \
     smoothing="$SMOOTHING" \
     fallback_prob="$FALLBACK_PROB" \
+    skip_empty_histories="$SKIP_EMPTY_HISTORIES" \
     max_concurrency="$MAX_CONCURRENCY" \
     max_retries="$MAX_RETRIES" \
     batch_size="$BATCH_SIZE" \

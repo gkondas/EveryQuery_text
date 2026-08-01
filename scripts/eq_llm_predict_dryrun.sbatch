@@ -75,6 +75,10 @@ export L4H_RECORD_TIME_MODE="days_before"   # index | days_before
 # Keep it equal to N_SAMPLES in the real script you are sizing.
 export N_SAMPLES=1
 
+# Charge nothing for rows whose history is empty, matching what the real run would send.
+# Keep equal to SKIP_EMPTY_HISTORIES in the script you are sizing or the estimate is wrong.
+export SKIP_EMPTY_HISTORIES=true
+
 # ─── END EDIT ME ────────────────────────────────────────────────────────────────────────
 
 cd "$REPO_DIR"
@@ -102,6 +106,7 @@ uv run EQ_llm_predict \
     split="$SPLIT" \
     prompt_style="$PROMPT_STYLE" \
     n_samples="$N_SAMPLES" \
+    skip_empty_histories="$SKIP_EMPTY_HISTORIES" \
     dry_run=true \
     dry_run_max_groups=null \
     "${extra_args[@]}"

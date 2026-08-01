@@ -70,6 +70,10 @@ class SampleResult:
     #: Float-extraction mode only: how many samples yielded a usable probability.  Always 0
     #: under the Yes/No vote, where ``n_yes + n_no`` carries the same information.
     n_parsed: int = 0
+    #: True when no request was sent at all (``skip_empty_histories``) and ``prob`` is the
+    #: configured fallback.  Distinct from ``parse_failed``, which means the model answered
+    #: and the answer was unusable — these rows never reached the model.
+    skipped: bool = False
 
 
 def parse_yes_no(text: str | None) -> str | None:
