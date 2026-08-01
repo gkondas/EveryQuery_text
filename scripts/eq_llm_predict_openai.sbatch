@@ -49,6 +49,9 @@ export PROMPT_STYLE="llm4healthcare"
 
 # --- event_stream knobs (ignored under llm4healthcare) ---
 export MAX_EVENTS=50
+# event_stream only. build_style does not accept descriptions for llm4healthcare, whose
+# question template renders the raw MEDS code either way — so under this arm the model is
+# asked about `LAB//51067//mg/24hr//value_[1260.0,1405.0)` verbatim, with no gloss.
 export CODE_DESCRIPTIONS="${TENSORIZED_COHORT_DIR}/metadata/codes.parquet"
 
 # --- llm4healthcare knobs (ignored under event_stream) ---
@@ -84,7 +87,7 @@ export SKIP_EMPTY_HISTORIES=true
 # Throughput. Tune MAX_CONCURRENCY to your OpenAI rate-limit tier: exhausting the retry
 # budget on 429s aborts the run by design (transport failures are never silently written
 # as fallback probabilities).
-export MAX_CONCURRENCY=4
+export MAX_CONCURRENCY=8
 export MAX_RETRIES=8
 
 # Rows per shard flush. Deliberately small: the in-flight buffer is flushed on Ctrl-C but
@@ -93,8 +96,12 @@ export MAX_RETRIES=8
 export BATCH_SIZE=25
 
 # Smoke test: set to a row count for a short verification run, or "" for the full pass.
-# Start with 20 to confirm the float parser survives real completions (check parse_failed
-# in details.parquet before committing to the full pass).
+# Confirms the float parser survives real completions — check parse_failed in details.parquet
+# before committing to the full pass.
+#
+# Use ~500, not 20. limit truncates the PENDING ROW LIST before histories are grouped, and
+# that list starts with empty-history rows, which SKIP_EMPTY_HISTORIES=true answers without
+# an API call. A small limit therefore sends zero requests and exits 0 having proven nothing.
 export LIMIT=""
 
 # API key. Kept OUT of this file on purpose — scripts/ is tracked by git and a literal key
@@ -177,4 +184,7 @@ uv run EQ_llm_predict \
 
 echo "finished=$(date -Is)"
 echo "predictions: $OUTPUT_DIR/predictions.parquet"
-echo "diagnostics: $OUTPUT_DIR/details.parquet  (parse_failed, n_yes/n_no/n_unparsed)"
+echo "diagnostics: $OUTPUT_DIR/details.parquet  (parse_failed, skipped, n_parsed, n_yes/n_no)"
+echo "NOTE: EQ_evaluate reads predictions.parquet, which has no 'skipped' column — join"
+echo "      details.parquet on subject_id/prediction_time/query/duration_days and drop the"
+echo "      skipped rows before reporting per-task AUROC."
