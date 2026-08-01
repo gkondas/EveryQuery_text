@@ -33,13 +33,13 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Keep these identical to the dry-run script — the dry run is only evidence for the
 # real run if both read the same cohort.
-export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out"
-export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
+export TASKS_DIR="/users/gbk2114/nwicu-eq/eval_tasks_500_20tasks/eval/held_out"
+export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/NWICU/processed"
 export SPLIT="held_out"
 
 # Output. A NEW directory — prompt_style is part of the run_fingerprint, so resume refuses to
 # extend shards written under the llm4healthcare arm. Do not aim this at the l4h output dir.
-export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_eventstream"
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_eventstream_nwicu"
 
 # Model. Must honor `max_tokens`, `temperature` and `n` on chat completions — reasoning models
 # (o-series, gpt-5) reject the first and ignore the second.

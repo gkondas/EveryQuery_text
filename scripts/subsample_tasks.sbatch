@@ -31,7 +31,7 @@ export OUTPUT_FILE="/users/gbk2114/nwicu-eq/eval_tasks_500/eval/held_out/tasks.p
 
 # Second output: same sampling, cut down to N_TASKS random (query, duration_days) tasks.
 # At the same SEED this is a strict row-subset of OUTPUT_FILE. Set N_TASKS=0 to skip it.
-#export OUTPUT_FILE_SMALL="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out/tasks.parquet"
+export OUTPUT_FILE_SMALL="/users/gbk2114/nwicu-eq/eval_tasks_500_20tasks/eval/held_out/tasks.parquet"
 export N_TASKS=20
 
 # Rows kept per label per task — 250 + 250 = 500 patients per task.

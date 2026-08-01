@@ -27,17 +27,17 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Keep these identical to eq_llm_predict_dryrun.sbatch — the dry run is only
 # evidence for the real run if both read the same cohort.
-export TASKS_DIR="FILL IN"
+export TASKS_DIR="/users/gbk2114/nwicu-eq/eval_tasks_500/eval/held_out"
 export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/NWICU/processed"
 export SPLIT="held_out"
 
 # Output. Use a NEW directory per configuration — resume refuses to extend shards written
 # under a different model/prompt/sampling config (the run_fingerprint check).
 #
-# Also new per TASKS_DIR, which the fingerprint does NOT cover: the ID-filtered subsample is
-# an independent draw, so resuming into llm_baseline_out_gpt_alltasks would union two
+# Also new per TASKS_DIR, which the fingerprint does NOT cover: each subsample is an
+# independent draw, so resuming a NWICU run into a MIMIC output dir would union two
 # different patient populations under the same task.
-export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_id_nwicu"
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_nwicu"
 
 # Model. Must honor `max_tokens` and `temperature` on chat completions — reasoning models
 # (o-series, gpt-5) reject the first and ignore the second, and their answer would be
@@ -77,8 +77,10 @@ export FALLBACK_PROB=0.501
 # yes_no arm.
 export SMOOTHING=0.0
 
-# ~77% of histories on this eval grid hold no mimic_icu17 measurement at all, so their prompt
-# is age + sex + "no measurements were recorded". true writes FALLBACK_PROB for those rows
+# A large share of histories hold no mimic_icu17 measurement at all (~77% on the MIMIC eval
+# grid; read the NWICU dry run's own count, do not assume this one carries over — the panel
+# maps MIMIC itemids, so NWICU may be far emptier). Those prompts are age + sex + "no
+# measurements were recorded". true writes FALLBACK_PROB for those rows
 # without sending a request — most of the API bill, none of the signal. They are flagged
 # `skipped` in details.parquet; drop them before reading their AUROC, since a constant
 # probability contributes only ties. false = ask the model anyway (the reference setup).

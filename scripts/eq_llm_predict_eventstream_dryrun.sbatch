@@ -35,13 +35,13 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Both must be readable from the COMPUTE node — a path that only exists on the login
 # node is exactly what this catches.
-export TASKS_DIR="/users/gbk2114/mimic-eq/eval_tasks_500_20tasks/eval/held_out"
-export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/MIMIC_MEDS/MEDS_cohort/processed"
+export TASKS_DIR="/users/gbk2114/nwicu-eq/eval_tasks_500_20tasks/eval/held_out"
+export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/NWICU/processed"
 export SPLIT="held_out"
 
 # Required by the config but never created under dry_run. Point it at the directory the real
 # run will use, so the printed banner matches what you are about to launch.
-export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_eventstream"
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_eventstream_nwicu"
 
 # max_events counts unique timestamps, NOT code lines — one ICU timestamp can expand to 60+
 # codes, so prompt length scales with codes-per-event. 50 matches the l4h dry run's window
