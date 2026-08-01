@@ -102,7 +102,7 @@ export BATCH_SIZE=25
 # Use ~500, not 20. limit truncates the PENDING ROW LIST before histories are grouped, and
 # that list starts with empty-history rows, which SKIP_EMPTY_HISTORIES=true answers without
 # an API call. A small limit therefore sends zero requests and exits 0 having proven nothing.
-export LIMIT="500"
+export LIMIT=""
 
 # API key. Kept OUT of this file on purpose — scripts/ is tracked by git and a literal key
 # here is one `git push` from a leak. Store it mode-600 instead:
