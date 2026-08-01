@@ -15,7 +15,7 @@
 set -euo pipefail
 
 export REPO_DIR="$HOME/EveryQuery_text"
-OUTPUT_DIR="${1:-/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_nwicu}"
+OUTPUT_DIR="${1:-/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_id_nwicu}"
 
 cd "$REPO_DIR"
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} started=$(date -Is) out=$OUTPUT_DIR"

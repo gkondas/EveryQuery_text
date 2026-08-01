@@ -30,13 +30,15 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Input: either a single TaskQuerySchema parquet or a directory of shards (read recursively).
 # The RAW grid, before any code filtering.
-export INPUT="/users/gbk2114/mimic-eq/eval_tasks/eval/held_out"
+export INPUT="/users/gbk2114/nwicu-eq/eval-new-sampler/eval/held_out"
 
-# The ID half of the code split. A YAML `codes:` list (or a flat list).
-export CODES="/users/gbk2114/mimic-eq/code-split/split__seed42__poolbbd2128d07ed__ood7450ad537df2__id1ad4b1f900eb/id_eval_codes.yaml"
+# The ID half of the code split. A YAML `codes:` list (or a flat list). MUST be the NWICU
+# split, not the MIMIC one — the script raises if nothing matches, but a PARTIAL match is
+# silent apart from the "N absent from input" line, so read that line before trusting the run.
+export CODES="/groups/mm6677_gp/data/NWICU/code-split/split__seed42__pool3cc17c86f45e__oodb0e525c8bf23__id14c9331281ce/id_eval_codes.yaml"
 
 # Output: a single parquet FILE (its parent directory is created by the script).
-export OUTPUT_FILE="/users/gbk2114/mimic-eq/eval_tasks_500_id/eval/held_out/tasks.parquet"
+export OUTPUT_FILE="/users/gbk2114/nwicu-eq/eval_tasks_500_id/eval/held_out/tasks.parquet"
 
 # Rows kept per label per task — 250 + 250 = 500 patients per task.
 export PER_CLASS=250

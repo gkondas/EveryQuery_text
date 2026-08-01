@@ -27,17 +27,17 @@ export REPO_DIR="$HOME/EveryQuery_text"
 
 # Inputs. Keep these identical to eq_llm_predict_dryrun.sbatch — the dry run is only
 # evidence for the real run if both read the same cohort.
-export TASKS_DIR="/users/gbk2114/nwicu-eq/eval_tasks_500/eval/held_out"
+export TASKS_DIR="/users/gbk2114/nwicu-eq/eval_tasks_500_id/eval/held_out"
 export TENSORIZED_COHORT_DIR="/groups/mm6677_gp/data/NWICU/processed"
 export SPLIT="held_out"
 
 # Output. Use a NEW directory per configuration — resume refuses to extend shards written
 # under a different model/prompt/sampling config (the run_fingerprint check).
 #
-# Also new per TASKS_DIR, which the fingerprint does NOT cover: each subsample is an
-# independent draw, so resuming a NWICU run into a MIMIC output dir would union two
-# different patient populations under the same task.
-export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_nwicu"
+# Also new per TASKS_DIR, which the fingerprint does NOT cover: the ID-filtered subsample is
+# an independent draw, so resuming a NWICU run into a MIMIC output dir — or into the
+# unfiltered draw — would union two different patient populations under the same task.
+export OUTPUT_DIR="/users/gbk2114/eq-neurips-rebuttle/llm_baseline_out_gpt_id_nwicu"
 
 # Model. Must honor `max_tokens` and `temperature` on chat completions — reasoning models
 # (o-series, gpt-5) reject the first and ignore the second, and their answer would be
