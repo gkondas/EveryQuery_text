@@ -42,6 +42,9 @@ dependencies = [
   "ipykernel>=7.2,<8",
   "scikit-learn>=1.6,<2",
   "matplotlib>=3.9,<4",
+  # Client SDK for the LLM baseline (EQ_llm_predict) — talks to a locally-served
+  # OpenAI-compatible endpoint (vLLM); no OpenAI account involved.
+  "openai>=1.60,<3",
 ] # Add your runtime dependencies here
 
 [dependency-groups]
@@ -82,6 +85,9 @@ EQ_predict = "every_query.predict.predict:main"
 # EQ_gen_eval_index / EQ_gen_eval_tasks / EQ_select_model) has been deleted per
 # the #83 consolidation wave; recover from git history if needed.
 EQ_evaluate = "every_query.evaluate.evaluate:main"
+# LLM baseline: serializes task histories as text, queries a locally-served LLM
+# (OpenAI-compatible API), writes PredictionSchema parquets consumable by EQ_evaluate.
+EQ_llm_predict = "every_query.llm_baseline.__main__:main"
 
 [tool.coverage.run]
 # Measure coverage for EQ_* CLIs launched via subprocess in tests/test_cli_smoke.py.
@@ -135,6 +141,9 @@ select = [
 "__init__.py" = ["F401"]  # Unused imports in __init__ files
 "test_*" = ["DTZ001"]  # Ignore datetimez in test files
 "*.ipynb" = ["E402"]  # Notebooks have imports spread across cells
+# Holds the llm4healthcare prompt template reproduced verbatim; its lines are the upstream
+# lines and rewrapping them would change the rendered prompt.
+"serialize_l4h.py" = ["E501"]
 
 [tool.ruff.lint.pep8-naming]
 extend-ignore-names = ["*MEDS*", "*NRT*", "D", "M", "L", "LR*"]

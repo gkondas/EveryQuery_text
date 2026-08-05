@@ -1,0 +1,146 @@
+# Feature panel for the ``llm4healthcare`` prompt style — the 17-variable MIMIC ICU panel
+# used by https://github.com/yhzhu99/llm4healthcare (which in turn takes it from the
+# Harutyunyan et al. MIMIC benchmark).
+#
+# Feature ``name`` strings, ``unit`` strings and ``range`` strings are reproduced VERBATIM
+# from that repo's ``prompts/mimic-iv/{unit,range}.json`` so the rendered prompt matches
+# theirs byte-for-byte.  That includes their misspelling of "Glascow" (sic) — do not
+# "fix" it; it would silently change the prompt being replicated.
+#
+# Feature order is theirs too (``run.py`` builds ``categorical_features + numerical_features``),
+# so the ``{DETAIL}`` block lists the five coma/refill rows first, then the twelve numeric rows.
+#
+# ``sources`` maps each feature onto this cohort's MEDS codes, in priority order: the first
+# source with a measurement at a given visit wins.  A source is keyed either by ``itemid``
+# (matching any ``PREFIX//<itemid>//…`` code, the MIMIC convention used throughout this file)
+# or by ``code`` (an exact match on the code string with any ``//value_[a,b)`` suffix
+# stripped, for cohorts that do not embed itemids).  ``transform`` converts a source's native
+# unit into the panel unit (``f_to_c``, ``fio2_fraction``).
+# ``kind: presence`` marks a feature whose codes carry no ``//value_[a,b)`` bin suffix, so
+# only presence/absence is recoverable — rendered as ``present`` / the missing marker.
+#
+# A feature whose itemids are all absent from the cohort vocabulary is NOT an error: it
+# renders as an all-missing row, which is exactly what the reference prompts show for
+# sparsely-charted variables (their own published examples have all-``nan`` rows for
+# Capillary refill rate, Glascow coma scale total, Height and pH).
+
+name: mimic_icu17
+description: >-
+  17-variable MIMIC ICU panel from llm4healthcare (yhzhu99), mapped onto MEDS codes by itemid.
+
+features:
+  # ── Categorical block (their ordering) ────────────────────────────────────────────────
+  - name: Capillary refill rate
+    unit: "Unit: /."
+    range: "Reference range: /."
+    kind: presence          # LAB//224308//UNK carries no value bins in this cohort
+    sources:
+      - itemid: 224308
+
+  - name: Glascow coma scale eye opening
+    unit: "Unit: /."
+    range: "Reference range: /."
+    sources:
+      - itemid: 220739
+
+  - name: Glascow coma scale motor response
+    unit: "Unit: /."
+    range: "Reference range: /."
+    sources:
+      - itemid: 223901
+
+  - name: Glascow coma scale total
+    unit: "Unit: /."
+    range: "Reference range: /."
+    sources:
+      - itemid: 226755      # absent from this cohort → all-missing row (as in their examples)
+
+  - name: Glascow coma scale verbal response
+    unit: "Unit: /."
+    range: "Reference range: /."
+    sources:
+      - itemid: 223900
+
+  # ── Numeric block (their ordering) ────────────────────────────────────────────────────
+  - name: Diastolic blood pressure
+    unit: "Unit: mmHg."
+    range: "Reference range: less than 80."
+    sources:
+      - itemid: 220180      # Non-invasive BP diastolic
+      - itemid: 220051      # Arterial BP diastolic
+
+  - name: Fraction inspired oxygen
+    unit: "Unit: /."
+    range: "Reference range: more than 0.21."
+    sources:
+      # Charted as a percentage (40) in this cohort but the panel range is a fraction
+      # ("more than 0.21"), so normalize the way the MIMIC benchmark does.
+      - itemid: 223835
+        transform: fio2_fraction
+
+  - name: Glucose
+    unit: "Unit: mg/dL."
+    range: "Reference range: 70 - 100."
+    sources:
+      - itemid: 220621      # Glucose (serum)
+      - itemid: 225664      # Glucose finger stick
+      - itemid: 226537      # Glucose (whole blood)
+
+  - name: Heart Rate
+    unit: "Unit: bpm."
+    range: "Reference range: 60 - 100."
+    sources:
+      - itemid: 220045
+
+  - name: Height
+    unit: "Unit: cm."
+    range: "Reference range: /."
+    sources:
+      - itemid: 226730
+
+  - name: Mean blood pressure
+    unit: "Unit: mmHg."
+    range: "Reference range: less than 100."
+    sources:
+      - itemid: 220181      # Non-invasive BP mean
+      - itemid: 220052      # Arterial BP mean
+
+  - name: Oxygen saturation
+    unit: "Unit: %."
+    range: "Reference range: 95 - 100."
+    sources:
+      - itemid: 220277
+
+  - name: Respiratory rate
+    unit: "Unit: breaths per minute."
+    range: "Reference range: 15 - 18."
+    sources:
+      - itemid: 220210
+
+  - name: Systolic blood pressure
+    unit: "Unit: mmHg."
+    range: "Reference range: less than 120."
+    sources:
+      - itemid: 220179      # Non-invasive BP systolic
+      - itemid: 220050      # Arterial BP systolic
+
+  - name: Temperature
+    unit: "Unit: degrees Celsius."
+    range: "Reference range: 36.1 - 37.2."
+    sources:
+      - itemid: 223762                # Temperature Celsius
+      - itemid: 223761                # Temperature Fahrenheit
+        transform: f_to_c
+
+  - name: Weight
+    unit: "Unit: kg."
+    range: "Reference range: /."
+    sources:
+      - itemid: 224639      # Daily weight
+      - itemid: 226512      # Admission weight
+
+  - name: pH
+    unit: "Unit: /."
+    range: "Reference range: 7.35 - 7.45."
+    sources:
+      - itemid: 223830
